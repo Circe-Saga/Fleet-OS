@@ -1,0 +1,8 @@
+fleet.db
+fleet.db-wal
+fleet.db-shm
+runs/
+STATUS.md
+__pycache__/
+*.pyc
+.env

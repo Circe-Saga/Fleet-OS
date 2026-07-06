@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 FLEET_HOME/hooks/session_start.py" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 FLEET_HOME/hooks/stop_guard.py" }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python3 FLEET_HOME/hooks/precompact_reminder.py" }
+        ]
+      }
+    ]
+  }
+}
