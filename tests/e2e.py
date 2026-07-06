@@ -2,7 +2,11 @@
 """End-to-end test of the Saga-Fleet golden path, in an isolated sandbox.
 
     python3 tests/e2e.py          # fake mode: free, CI-safe (worker actions simulated)
-    python3 tests/e2e.py --live   # real headless `claude` worker (~$0.30, needs the CLI)
+    python3 tests/e2e.py --live   # real headless Claude Code worker (~$0.30, needs the CLI)
+
+Model access: the live worker runs via Claude Code headless mode (`claude -p`) using your
+existing Claude Code auth — NO direct model API and NO Bedrock/AWS credentials are used
+anywhere in this test or in the fleet runtime. Fake mode calls no model at all.
 
 Exercises the full loop the unit tests only cover piecewise:
   task add → IN_PROGRESS → spawn (worktree off a scratch repo, hooks stamped)
@@ -83,7 +87,8 @@ class E2E:
 
     # ── scenario ────────────────────────────────────────────────────────────
     def run(self) -> int:
-        mode = "LIVE (real claude worker)" if self.live else "FAKE (simulated worker)"
+        mode = ("LIVE (real worker via Claude Code headless — your `claude` auth, no direct "
+                "API/Bedrock)" if self.live else "FAKE (simulated worker, no model calls)")
         print(f"Saga-Fleet e2e — {mode}\nsandbox: {self.tmp.name}")
 
         self.stage("0 · scratch repo")

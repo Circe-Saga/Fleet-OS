@@ -53,6 +53,15 @@ prompt. Leadership conventions (doc-task gates, weekly memo cadence, self-filed 
 `python3 fleet.py status` lists the `leadership`-layer agents; address them all at once with
 `fleet msg --to leadership`.
 
+## Agent runtime vs product inference (where Bedrock does and doesn't appear)
+
+The fleet runs agents **exclusively through Claude Code** (`claude -p --resume`, headless) or
+the Codex CLI — your existing CLI auth, session resume, hooks, and permission modes for free.
+**No direct model API calls, no boto3, no Bedrock credentials anywhere in this repo or its
+tests** (grep-verifiable). The Bedrock mentions in `profiles/*.md` are knowledge FOR agents
+who write code against Saga's *product* pipeline, which calls Bedrock in prod/EvalLab — that's
+product inference, a separate layer with its own (F10) platform strategy, not how agents run.
+
 ## Models
 
 Agents store a model **alias** (`haiku`/`sonnet`/`opus`/`fable`); the `MODELS` registry in
