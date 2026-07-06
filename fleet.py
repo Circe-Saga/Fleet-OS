@@ -1160,7 +1160,9 @@ def _render_starter(con, t, agent_row) -> str:
         f"  - blockers: fleet msg --from {slug} --to <who-can-clear-it> --tier BLOCKER "
         "--kind request --requires-action --body …",
         f"  - claim completion evidence: fleet task evidence --id {t['id']} --test-cmd \"…\" "
-        "[--pr …]; then ask the Conductor for the gate (you cannot set IN_REVIEW/DONE yourself).",
+        "[--pr …]; then ask the Conductor for the gate (you cannot set IN_REVIEW/DONE yourself). "
+        "The test-cmd is re-run by the Conductor with YOUR WORKTREE as cwd — use worktree-"
+        "relative paths, no `cd`, no absolute paths, no shell comments.",
         "  - propose decisions WITH a default: fleet decide --stream " + slug +
         " --question … --default … [--reversible --expires 24] --category …",
         "",
