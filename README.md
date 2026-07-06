@@ -74,8 +74,15 @@ workers never touch it and its downtime never blocks anything (PLAYBOOK §5b).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s tests -v   # 36 unit/integration tests (fake launcher, tmp DBs)
+python3 tests/e2e.py                       # full golden-path e2e, simulated worker (free, CI-safe)
+python3 tests/e2e.py --live                # same path with a REAL headless claude worker (~$0.20)
 ```
+
+The e2e drives the whole loop in a throwaway sandbox: task → spawn (worktree + hooks) →
+worker edits code, claims evidence, checkpoints → harvest (cost/session) → verify gate →
+review policy → review blocks DONE → clears → decision auto-proceed → tick → founder queue →
+retire → events audit. 25 checks; exit 0 = pass.
 
 ## Migration from the EvalLab fleet (v1)
 
