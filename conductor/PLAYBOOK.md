@@ -172,4 +172,9 @@ assignment, spend by model, recent switches). Agents store the ALIAS (`sonnet`/`
 - Never mark DONE on a self-report. Never skip the territory-overlap refusal with --force
   unless you've read both diffs yourself.
 - Two failed resumes on the same task = stop driving it; escalate with the run refs.
-- Budget overruns stop resumption immediately; the founder decides top-ups.
+- **Budgets (founder directive 2026-07-06): do NOT set budget caps on tasks.** The fleet runs
+  on Claude Code subscription auth — the `cost_usd` figures are API-equivalent *estimates*
+  Claude Code reports, useful only as usage/rate-limit telemetry (spend-by-model in
+  `fleet report`), never as money spent and never as a reason to stop a worker. Leave
+  `budget_usd` unset; the over-budget escalation path is dormant. If auth ever moves to an
+  API key, this rule flips — verify with `env | grep -i anthropic` before assuming.

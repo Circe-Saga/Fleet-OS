@@ -1,9 +1,10 @@
 # Saga-Fleet — the Agent OS substrate + worker runtime
 
 Workspace-scoped coordination for the Saga agent fleet. Design:
-[`../docs/agent-os-design.md`](../docs/agent-os-design.md) · implementation briefs:
-[`../briefs/agent-os/`](../briefs/agent-os/) · Conductor procedure:
-[`conductor/PLAYBOOK.md`](conductor/PLAYBOOK.md).
+[`docs/DESIGN.md`](docs/DESIGN.md) · implementation briefs:
+[`docs/briefs/`](docs/briefs/) · Conductor procedure:
+[`conductor/PLAYBOOK.md`](conductor/PLAYBOOK.md) · adopting this for your own
+fleet: [`ADOPTING.md`](ADOPTING.md).
 
 **Thesis:** the v1 EvalLab fleet proved the state layer (addressed messages,
 focused-but-complete briefs, checkpoints). What was missing is the **driver** — nothing wakes
