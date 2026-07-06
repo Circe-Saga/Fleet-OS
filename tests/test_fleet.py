@@ -473,6 +473,44 @@ class TestModels(FleetCase):
         self.assertIn("fable", out)
 
 
+class TestKestral(FleetCase):
+    def test_pending_and_mark_roundtrip(self):
+        self.fleet("set", "--slug", "lane-a", "--state", "ACTIVE")
+        tid = self.add_task()
+        self.fleet("decide", "--question", "ship?", "--category", "taste", "--default", "yes")
+        d = json.loads(self.fleet("kestral-pending").stdout)
+        self.assertEqual(len(d["agents"]), 1)
+        self.assertEqual(len(d["open_tasks"]), 1)
+        self.assertEqual(len(d["open_decisions"]), 1)
+        self.assertIn("idempotency", d["mapping"])
+        self.assertIsNone(d["open_tasks"][0]["kestral_id"])
+        self.fleet("kestral-mark", "--task", str(tid), "--kestral-id", "KT-42")
+        self.fleet("kestral-mark", "--workstream", "lane-a", "--kestral-id", "KW-7")
+        d = json.loads(self.fleet("kestral-pending").stdout)
+        self.assertEqual(d["open_tasks"][0]["kestral_id"], "KT-42")
+        self.assertEqual(d["agents"][0]["kestral_id"], "KW-7")
+        r = self.fleet("kestral-mark", "--task", "999", "--kestral-id", "X", expect=2)
+        self.assertIn("no tasks row", r.stderr)
+
+    def test_mark_requires_exactly_one_target(self):
+        self.fleet("status")
+        r = self.fleet("kestral-mark", "--kestral-id", "X", expect=2)
+        self.assertIn("exactly one", r.stderr)
+
+
+class TestVerifyRace(FleetCase):
+    def test_reclaim_mid_verify_discards_result(self):
+        tid = self.add_task()
+        # claim a slow command that re-claims evidence WHILE verify is running it
+        reclaim = (f"{PY} {FLEET} task evidence --id {tid} --test-cmd true >/dev/null 2>&1")
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", f"sh -c '{reclaim}'")
+        r = self.fleet("verify", "--task", str(tid), expect=1)
+        self.assertIn("re-claimed while verify ran", r.stderr)
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertNotIn("verified_by_conductor", ev)  # stale claim never got stamped
+        self.assertIn("gate-stale", [e["action"] for e in self.q("SELECT action FROM events")])
+
+
 class TestReviewPolicy(FleetCase):
     def test_triggers(self):
         t_prod = self.add_task(repo="Saga-FastAPI")

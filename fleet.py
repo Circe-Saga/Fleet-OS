@@ -201,6 +201,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     # SYSTEM prompt on every spawn/run, so the role persists across sessions and resumes.
     ("workstreams", "role_prompt", "TEXT"),
     ("runs", "model", "TEXT"),   # which model powered the run (alias; the launch-time truth)
+    ("tasks", "kestral_id", "TEXT"),  # idempotency key for the one-way Kestral mirror
     ("messages",  "kind",            "TEXT DEFAULT 'fyi'"),
     ("messages",  "requires_action", "INTEGER DEFAULT 0"),
     ("messages",  "supersedes_id",   "INTEGER"),
@@ -557,11 +558,11 @@ def cmd_resolve_expired(con, a) -> int:
 
 
 def cmd_ack(con, a) -> int:
-    row = con.execute("SELECT * FROM read_state WHERE slug=?", (a.slug,)).fetchone()
-    acked = set(_loads(row["acked_ids"], []) if row else [])
-    acked.add(a.id)
-    last_read = row["last_read_ts"] if row else None
-    with write_txn(con):
+    with write_txn(con):  # read-merge-write under the lock (an agent may ack from 2 shells)
+        row = con.execute("SELECT * FROM read_state WHERE slug=?", (a.slug,)).fetchone()
+        acked = set(_loads(row["acked_ids"], []) if row else [])
+        acked.add(a.id)
+        last_read = row["last_read_ts"] if row else None
         con.execute("""INSERT INTO read_state (slug,last_read_ts,acked_ids) VALUES (?,?,?)
                        ON CONFLICT(slug) DO UPDATE SET acked_ids=excluded.acked_ids""",
                     (a.slug, last_read, json.dumps(sorted(acked))))
@@ -874,21 +875,23 @@ def cmd_task_assign(con, a) -> int:
 
 
 def cmd_task_evidence(con, a) -> int:
-    """Worker CLAIMS evidence. Claims are leads; `fleet verify` turns them into gates."""
-    t = _get_task(con, a.id)
-    if not t:
+    """Worker CLAIMS evidence. Claims are leads; `fleet verify` turns them into gates.
+    The read-merge-write happens INSIDE the write transaction (BEGIN IMMEDIATE holds the lock
+    from the read), so two concurrent claims can't silently drop each other's fields."""
+    if not _get_task(con, a.id):
         print(f"ERROR: no task #{a.id}", file=sys.stderr)
         return 2
-    ev = _loads(t["evidence"], {})
-    for key, val in (("test_cmd", a.test_cmd), ("pr", a.pr), ("ci_url", a.ci_url),
-                     ("notes", a.notes)):
-        if val is not None:
-            ev[key] = val
-    if a.review_requested:
-        ev["review_requested"] = True
-    ev.pop("verified_by_conductor", None)  # any new claim invalidates prior verification
-    ev.pop("verified_ts", None)
     with write_txn(con):
+        t = _get_task(con, a.id)
+        ev = _loads(t["evidence"], {})
+        for key, val in (("test_cmd", a.test_cmd), ("pr", a.pr), ("ci_url", a.ci_url),
+                         ("notes", a.notes)):
+            if val is not None:
+                ev[key] = val
+        if a.review_requested:
+            ev["review_requested"] = True
+        ev.pop("verified_by_conductor", None)  # any new claim invalidates prior verification
+        ev.pop("verified_ts", None)
         con.execute("UPDATE tasks SET evidence=?, updated_ts=? WHERE id=?",
                     (json.dumps(ev), now_iso(), a.id))
     print(f"✓ task #{a.id} evidence claimed (unverified until `fleet verify --task {a.id}`)")
@@ -987,6 +990,16 @@ def cmd_verify(con, a) -> int:
     except subprocess.TimeoutExpired:
         ok, tail = False, f"(timed out after {a.timeout}s)"
     with write_txn(con):
+        # The test may run for minutes — re-read evidence INSIDE the lock and merge into the
+        # fresh copy. If the worker re-claimed a DIFFERENT test_cmd mid-verify, we verified a
+        # stale claim: don't stamp it.
+        ev = _loads(_get_task(con, a.id)["evidence"], {})
+        if ev.get("test_cmd") != cmd:
+            _event(con, "conductor", "gate-stale", f"task:{a.id}",
+                   f"claim changed mid-verify (ran `{cmd}`)")
+            print(f"⚠ task #{a.id}: evidence was re-claimed while verify ran — result "
+                  f"discarded; re-run fleet verify", file=sys.stderr)
+            return 1
         if ok:
             ev["verified_by_conductor"] = True
             ev["verified_ts"] = now_iso()
@@ -1589,6 +1602,60 @@ def cmd_report(con, a) -> int:
     return 0
 
 
+def cmd_kestral_pending(con, a) -> int:
+    """Rows needing a Kestral push, as JSON, for the CONDUCTOR to sync via the Kestral MCP.
+    Pure Python can't call MCP tools — the Conductor reads this and drives execute_operation
+    (create_task/update_task/add_task_comment), then stores returned ids via `kestral-mark`
+    so subsequent pushes UPDATE instead of duplicating. One-way, best-effort, never on any
+    worker's critical path (design §4.5 / v1 design §10)."""
+    agents = [dict(r) for r in con.execute(
+        "SELECT slug,state,status_line,next,blockers,branch,repo,model,kestral_id,updated_ts "
+        "FROM workstreams").fetchall()]
+    tasks = [dict(r) for r in con.execute(
+        "SELECT id,objective,kind,state,owner_slug,repo,branch,budget_usd,spent_usd,kestral_id,"
+        "updated_ts FROM tasks WHERE state NOT IN ('DONE','PARKED')").fetchall()]
+    decisions = [dict(r) for r in con.execute(
+        "SELECT id,stream,question,detail,category,default_recommendation,expires_ts,kestral_id,"
+        "raised_ts FROM decisions WHERE resolved_ts IS NULL").fetchall()]
+    print(json.dumps({
+        "generated_ts": now_iso(),
+        "agents": agents, "open_tasks": tasks, "open_decisions": decisions,
+        "mapping": {
+            "project": "one Kestral Project for the fleet; source:'saga-fleet' on every object",
+            "task_status": "Kestral has 3 statuses only: QUEUED/IN_PROGRESS/IN_REVIEW → "
+                           "in_progress, DONE/PARKED → done, BLOCKED/NEEDS_HUMAN → in_progress "
+                           "+ tag 'blocked'/'needs-user' (probed limit, v1 design §10)",
+            "owner": "agents can't be Kestral members — tag owner:<slug>; decisions get "
+                     "assigneeId = the human founder so they land in his real queue",
+            "branch": "task branchName = tasks.branch; add PR links as comments",
+            "idempotency": "rows with kestral_id != null → update_task; null → create_task "
+                           "(duplicatePolicy on), then `fleet kestral-mark` the returned id",
+            "cadence": "push at tick end, best-effort; failure = log + retry next tick, "
+                       "NEVER blocks a worker or a write",
+        }}, indent=2, default=str))
+    return 0
+
+
+def cmd_kestral_mark(con, a) -> int:
+    """Store a Kestral object id back onto a fleet row (makes the next push an update)."""
+    target = [(t, i) for t, i in (("workstreams", a.workstream), ("tasks", a.task),
+                                  ("decisions", a.decision)) if i is not None]
+    if len(target) != 1:
+        print("ERROR: pass exactly one of --workstream <slug> | --task <id> | --decision <id>",
+              file=sys.stderr)
+        return 2
+    table, ident = target[0]
+    key = "slug" if table == "workstreams" else "id"
+    with write_txn(con):
+        cur = con.execute(f"UPDATE {table} SET kestral_id=? WHERE {key}=?",
+                          (a.kestral_id, ident))
+        if cur.rowcount == 0:
+            print(f"ERROR: no {table} row {ident}", file=sys.stderr)
+            return 2
+    print(f"✓ {table}:{ident} ↔ kestral:{a.kestral_id}")
+    return 0
+
+
 def cmd_models(con, a) -> int:
     """Model tracking view: the registry, which agents run on what, spend by model."""
     print("MODEL REGISTRY (alias → launch id; unknown aliases pass through untouched)")
@@ -1816,6 +1883,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agent", required=True)
     s.add_argument("--rm-worktree", action="store_true")
     s.set_defaults(fn=cmd_retire)
+
+    s = sub.add_parser("kestral-pending", help="JSON dump for the Conductor's Kestral MCP push")
+    s.set_defaults(fn=cmd_kestral_pending)
+
+    s = sub.add_parser("kestral-mark", help="store a Kestral id on a fleet row (idempotent pushes)")
+    s.add_argument("--workstream"); s.add_argument("--task", type=int)
+    s.add_argument("--decision", type=int)
+    s.add_argument("--kestral-id", required=True)
+    s.set_defaults(fn=cmd_kestral_mark)
 
     s = sub.add_parser("models", help="model registry, per-agent assignment, spend by model")
     s.add_argument("--limit", type=int, default=10)

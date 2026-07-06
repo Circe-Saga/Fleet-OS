@@ -63,6 +63,14 @@ model, recent switches) and `fleet report` (spend by model per window). Switch w
 --input …` (persists on the agent row, logged as a `model-switch` event). Every run row
 records the model that powered it. Escalation policy: `conductor/PLAYBOOK.md` §"Model strategy".
 
+## Kestral (leadership mirror)
+
+One-way, best-effort, Conductor-driven: `fleet kestral-pending` dumps everything needing a
+push (with the probed mapping hints — 3-status limit, tags for blocked/needs-user, decisions
+assigned to the founder); the Conductor drives the Kestral MCP and stores returned ids via
+`fleet kestral-mark` so pushes stay idempotent. fleet.db is the record; Kestral is a view;
+workers never touch it and its downtime never blocks anything (PLAYBOOK §5b).
+
 ## Tests
 
 ```bash

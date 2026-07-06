@@ -62,6 +62,13 @@ For each gate request:
     --context "<PR url> :: the diff" --context "<contract path> :: what it must not break"`
    Assign to a NON-author agent. A review with zero executed checks bounces — the
    falsifiable-findings rule applies to reviewers too.
+   **Compaction mandate:** LLM-authored diffs trend wordy. Every review task's scope includes
+   flagging bloat — dead abstraction, defensive boilerplate, comments that narrate the diff,
+   3 functions where 1 reads better — as non-blocking `review-finding`s with a proposed
+   tighter shape. For merged-but-flabby lanes, spawn a dedicated ephemeral
+   `kind=review --objective "compaction pass: <territory>"` task (same territory, AFTER
+   merge-green, gated by the same tests) rather than a standing "refactor agent" seat —
+   compactness is a review dimension, not a department.
 3. Verified + review clear → `fleet task set-state --id N --state IN_REVIEW|DONE --actor conductor`.
    Bounce → `fleet msg --from conductor --to <owner> --kind review-finding --tier BLOCKER
    --body "<what failed + the exact failing command>"`.
@@ -75,6 +82,16 @@ For each gate request:
   design docs, another agent (`fleet inspect`), or a reversible default? The founder is called
   for: human-only decisions, authorization, ambiguous taste, e2e verification, architecture
   violations. Nothing else.
+
+### 5b. Kestral mirror (one-way, best-effort — YOU push, workers never touch it)
+
+At tick end: `fleet kestral-pending` → drive the Kestral MCP (`execute_operation`:
+create_task / update_task / add_task_comment) per the mapping hints in the JSON, then
+`fleet kestral-mark --task N --kestral-id X` for anything newly created so the next push
+updates instead of duplicating. Rules: fleet.db is the record and Kestral is a downstream
+human/leadership view; a failed push is a logged no-op retried next tick; nothing about
+Kestral ever blocks a worker, a write, or a gate. Comment on Kestral tasks only at phase
+boundaries, blocker changes, review summaries, PR links — not every checkpoint.
 
 ### 6. Close the loop
 - Weekly: `fleet report --days 7` to the founder — shipped, human-touches/shipped (the KPI),
@@ -112,8 +129,23 @@ executors. Same substrate, four different conventions:
    must still carry defaults and categories like everyone else's.
 
 Roles that map onto existing machinery — do NOT hire separately: Chief of Staff / Program
-Manager = **you** (the Conductor); Code Review Principal = the standing assignee for F5 review
-tasks; Head of AI-Native Tools **owns this repo** (fleet.py, hooks, briefs) once seated.
+Manager = **you** (the Conductor — the `conductor` agent row carries that role prompt; its
+weekly-synthesis duty is your tick §6); Code Review Principal = a pre-registered SPLIT from
+Head of Code Quality (they call it, with PR-volume data — not a Day-1 seat); Head of
+AI-Native Tools **owns this repo** (fleet.py, hooks, briefs) once seated.
+
+**The 15-seat discipline check (Fable's caution — enforce it).** A large cabinet only works
+if you genuinely collapse everything into ONE weekly founder brief and escalations stay
+rationed. Watch two numbers in your weekly report: founder decision-latency and
+context-switch count (escalations reaching Jacky per week). If either RISES after a seat is
+added, the cabinet is becoming the bottleneck it was meant to relieve: **cut back to the
+original nine plus Chief Architect and Customer Research** (the two with the least
+substitutable ownership) and demote the rest to on-demand consultations — spawn them for a
+question, retire them after — rather than standing memo-writers. More agents is less leverage
+past the point where reading them costs more than they save. Spawn order for batch 2:
+Customer Research (retreat-clocked) → Chief Architect → Data & Telemetry → (Chief-of-Staff
+duties activate in you) → Eval Science → Design. Media Intelligence stays PARKED until the
+quality wave.
 
 ## Model strategy
 
