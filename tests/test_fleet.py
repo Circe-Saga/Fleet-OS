@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -390,6 +391,86 @@ class TestHumanSurface(FleetCase):
         self.assertIn("judgment queue", out)
         self.assertIn(f"ready QUEUED tasks [{t1}]", out)
         self.assertTrue(self.waiting.exists())
+
+
+class TestRolePrompts(FleetCase):
+    def role_doc(self):
+        p = self.workspace / "ROLES.md"
+        p.write_text("# Cabinet\n\n## COMMON CONTEXT (prepend)\nYou are a senior leader.\n\n"
+                     "## 1. HEAD OF PRODUCT\nYou own what gets built.\n\n"
+                     "## 2. HEAD OF GROWTH\nYou own the funnels.\n")
+        return "ROLES.md"  # workspace-relative
+
+    def test_role_rides_system_prompt_on_spawn(self):
+        doc = self.role_doc()
+        tid = self.add_task(kind="doc", done="memo exists")
+        spec = f"{doc}#COMMON CONTEXT,{doc}#HEAD OF PRODUCT"
+        self.fleet("set", "--slug", "head-of-product", "--role-prompt", spec)
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "head-of-product", "--dry-run")
+        self.assertIn("--append-system-prompt", r.stdout)
+        self.assertIn("<role prompt,", r.stdout)
+        out = self.fleet("starter", "--task", str(tid), "--agent", "head-of-product").stdout
+        self.assertIn("ROLE: your standing role prompt", out)
+
+    def test_section_extraction_scopes_correctly(self):
+        doc = self.role_doc()
+        tid = self.add_task()
+        # No masking in starter path — verify via a worker whose role is ONE section
+        self.fleet("set", "--slug", "hg", "--role-prompt", f"{doc}#HEAD OF GROWTH")
+        # extract via spawn (no repo → no worktree) with real launcher output file
+        self.fleet("spawn", "--task", str(tid), "--agent", "hg")
+        time.sleep(0.5)
+        self.fleet("harvest")
+        # the fake launcher received the role via --append-system-prompt; confirm from the
+        # recorded spawn command is not possible, so assert on _load_role_text via a second
+        # spawn --dry-run length: growth section only (short)
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "hg", "--dry-run")
+        m = re.search(r"<role prompt, (\d+) chars>", r.stdout)
+        self.assertIsNotNone(m)
+        self.assertLess(int(m.group(1)), 120)  # one short section, not the whole doc
+
+    def test_missing_role_source_fails_soft(self):
+        tid = self.add_task()
+        self.fleet("set", "--slug", "ghost", "--role-prompt", "nonexistent/ROLES.md#NOPE")
+        # Must not crash the spawn; the role slot still carries a (short) visible missing-note
+        # so the worker and Conductor see the gap.
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "ghost", "--dry-run")
+        m = re.search(r"<role prompt, (\d+) chars>", r.stdout)
+        self.assertIsNotNone(m)
+        self.assertLess(int(m.group(1)), 100)  # the one-line missing-note, not real content
+
+
+class TestModels(FleetCase):
+    def test_alias_resolves_at_launch(self):
+        tid = self.add_task()
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "ax", "--model", "fable",
+                       "--dry-run")
+        self.assertIn("claude-fable-5", r.stdout)
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "ax",
+                       "--model", "some-future-model", "--dry-run")
+        self.assertIn("some-future-model", r.stdout)  # unknown alias passes through
+
+    def test_run_records_model_and_switch_is_logged(self):
+        tid = self.add_task()
+        self.fleet("spawn", "--task", str(tid), "--agent", "ax", "--model", "sonnet")
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if "finished" in self.fleet("harvest").stdout:
+                break
+            time.sleep(0.3)
+        self.assertEqual(self.q("SELECT model FROM runs")[0]["model"], "sonnet")
+        self.fleet("run", "--agent", "ax", "--input", "continue", "--model", "opus")
+        self.assertEqual(self.q("SELECT model FROM workstreams WHERE slug='ax'")[0]["model"],
+                         "opus")
+        self.assertEqual(self.q("SELECT model FROM runs ORDER BY id DESC")[0]["model"], "opus")
+        self.assertIn("model-switch", [e["action"] for e in self.q("SELECT action FROM events")])
+
+    def test_models_view(self):
+        self.fleet("set", "--slug", "ax", "--state", "ACTIVE", "--model", "fable")
+        out = self.fleet("models").stdout
+        self.assertIn("claude-fable-5", out)
+        self.assertIn("ACTIVE AGENTS by model", out)
+        self.assertIn("fable", out)
 
 
 class TestReviewPolicy(FleetCase):

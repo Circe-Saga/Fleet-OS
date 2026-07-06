@@ -42,6 +42,27 @@ checkpoint (hook). They claim evidence (`fleet task evidence`); only the Conduct
 IN_REVIEW/DONE, after `fleet verify` re-runs the claim. Decisions raised with
 `--reversible --default … --expires H` auto-proceed — the queue drains itself.
 
+## Role-class agents (any team, not just SWE lanes)
+
+Any agent can carry a standing **role prompt** — `--role-prompt "path[#heading],…"` on `set`
+or `spawn` (paths relative to the workspace; `#heading` extracts one section of a shared doc,
+so one cabinet file serves nine roles unsplit). The role text rides the worker's system prompt
+on every spawn AND resume, so identity survives compaction; the task brief stays the user
+prompt. Leadership conventions (doc-task gates, weekly memo cadence, self-filed tasks):
+`conductor/PLAYBOOK.md` §"Role-class agents". The Saga leadership cabinet is pre-seeded —
+`python3 fleet.py status` lists the `leadership`-layer agents; address them all at once with
+`fleet msg --to leadership`.
+
+## Models
+
+Agents store a model **alias** (`haiku`/`sonnet`/`opus`/`fable`); the `MODELS` registry in
+fleet.py resolves real ids at launch, so a new model = one registry line + a
+`profiles/<alias>.md`. Track with `fleet models` (registry, per-agent assignment, spend by
+model, recent switches) and `fleet report` (spend by model per window). Switch with
+`fleet set --slug X --model opus` or mid-conversation via `fleet run --agent X --model opus
+--input …` (persists on the agent row, logged as a `model-switch` event). Every run row
+records the model that powered it. Escalation policy: `conductor/PLAYBOOK.md` §"Model strategy".
+
 ## Tests
 
 ```bash

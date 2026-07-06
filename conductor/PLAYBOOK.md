@@ -84,6 +84,56 @@ For each gate request:
 - Watch your own footprint: if coordination overhead (routing msgs, ceremony) exceeds ~10–15%
   of fleet spend, cut protocol — don't tune it.
 
+## Role-class agents (leadership cabinet / any specialized team)
+
+Some agents are standing ROLES (Head of Product, Trust & Privacy, …) rather than task
+executors. Same substrate, four different conventions:
+
+1. **Identity = `role_prompt`.** Each role agent carries a standing prompt spec
+   (`fleet set --slug head-of-product --role-prompt "path.md#COMMON CONTEXT,path.md#HEAD OF
+   PRODUCT"`). It rides the system prompt on every spawn/resume — the role defines who they
+   are; the task brief defines the work. The cabinet's specs point at
+   `Saga-Docs/docs/leadership/LEADERSHIP_AGENT_PROMPTS.md`; any team can add its own file.
+2. **Doc/judgment tasks gate differently.** `kind=doc|investigate` deliverables (memos,
+   charters, audits) have no test_cmd. done_criteria must still be falsifiable ("memo at
+   <path>, states the pivot trigger with thresholds, confidence-labeled"). The gate is:
+   (a) artifact committed on the agent's branch (verify can `test -f` / grep sections), and
+   (b) substance via a review task (peer role or founder) or a `verification`-category
+   decision — NEVER test_cmd theater. Deliverables live in Saga-Docs; memos are PRs.
+3. **Cadence.** Standing obligations (weekly memo, audits) are Conductor-driven: on the first
+   tick of each week, create the memo tasks for each active role agent and resume their
+   sessions with the rendered starter. (Or wire a `/schedule` cron that runs a tick with this
+   instruction.) The weekly memo convention: one page in Saga-Docs + `fleet msg --to conductor
+   --kind handoff` with the one decision needed — you fold the decision into WAITING_ON_YOU.
+4. **Latitude.** Role agents are EXPECTED to self-file tasks (`fleet task add --actor <slug>`)
+   and propose/reframe their own charters — you gate and sequence their tasks, but you do not
+   originate their agendas. Disagreement (with the founder, the pre-mortem, or you) is a
+   feature; route steelmanned disagreements between roles before escalating. Their escalations
+   must still carry defaults and categories like everyone else's.
+
+Roles that map onto existing machinery — do NOT hire separately: Chief of Staff / Program
+Manager = **you** (the Conductor); Code Review Principal = the standing assignee for F5 review
+tasks; Head of AI-Native Tools **owns this repo** (fleet.py, hooks, briefs) once seated.
+
+## Model strategy
+
+You own model assignment for the fleet (`fleet models` is your view: registry, per-agent
+assignment, spend by model, recent switches). Agents store the ALIAS (`sonnet`/`opus`/`fable`/
+`haiku`); the launcher resolves real ids, so onboarding a new model = one registry entry + a
+`profiles/<alias>.md` from its calibration findings.
+
+- **Defaults:** implementation/test/doc lanes → `sonnet`. Long cross-file relational work,
+  repeated review bounces, or contract-heavy refactors → `opus`. Architecture decomposition,
+  leadership cabinet, final pre-prod review → `fable`. Bulk mechanical sweeps → `haiku`.
+- **Escalate on evidence, not vibes:** two gate bounces on the same task, or a same-failure-
+  twice stop, is the trigger to re-run with the next tier up
+  (`fleet run --agent X --model opus --input …` — the switch persists, works mid-session, and
+  is logged as a `model-switch` event).
+- **De-escalate too:** watch `fleet report`'s spend-by-model; a frontier model coasting
+  through routine tasks is budget the review tier isn't getting.
+- Profiles are load-bearing: the starter injects `profiles/<alias>.md`, so keep each model's
+  known failure modes current as DISCOVERIES land (Opus tail-drop, S5 temperature rejection…).
+
 ## Standing rules
 - Never run or verify anything in a primary checkout — worker worktrees only (`fleet verify`
   does this for you; don't hand-roll).

@@ -64,6 +64,24 @@ STALE_TASK_HOURS = 12     # IN_PROGRESS w/o running session + no checkpoint for 
 GATED_STATES = ("IN_REVIEW", "DONE")
 CONDUCTOR_ACTORS = ("conductor", "founder")
 
+# Model registry: agents store the ALIAS (so `profiles/<alias>.md` and reports stay stable);
+# the launcher resolves it to the product's real model id at invocation time. Unknown names
+# pass through untouched — adopting a brand-new model needs no code change, just (optionally)
+# a registry entry + a profile file.
+MODELS = {
+    "haiku":  {"id": "claude-haiku-4-5-20251001", "product": "claude", "tier": "fast"},
+    "sonnet": {"id": "claude-sonnet-5",           "product": "claude", "tier": "workhorse"},
+    "opus":   {"id": "claude-opus-4-8",           "product": "claude", "tier": "strong"},
+    "fable":  {"id": "claude-fable-5",            "product": "claude", "tier": "frontier"},
+}
+
+
+def _resolve_model(name: str | None) -> str | None:
+    if not name:
+        return None
+    return MODELS.get(name, {}).get("id", name)
+
+
 # Prod-facing repos: tier-1 review triggers (see `review-policy`).
 PROD_REPOS = ("Saga-FastAPI", "Saga-AIEditor", "Saga-MediaProcessing", "Saga-CDK",
               "Saga-React-WebApp", "Saga-Core")
@@ -144,6 +162,7 @@ CREATE TABLE IF NOT EXISTS runs (
   agent_slug    TEXT NOT NULL,
   task_id       INTEGER,
   product       TEXT NOT NULL CHECK (product IN ('claude','codex')),
+  model         TEXT,
   session_id    TEXT,
   status        TEXT NOT NULL CHECK (status IN ('running','finished','failed','abandoned')),
   pid           INTEGER,
@@ -177,6 +196,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("workstreams", "worktree",   "TEXT"),
     ("workstreams", "session_id", "TEXT"),
     ("workstreams", "lifetime",   "TEXT DEFAULT 'territory'"),
+    # Standing role identity (leadership/any specialized role): comma-separated list of
+    # "path[#heading]" specs, resolved relative to WORKSPACE. Injected into the worker's
+    # SYSTEM prompt on every spawn/run, so the role persists across sessions and resumes.
+    ("workstreams", "role_prompt", "TEXT"),
+    ("runs", "model", "TEXT"),   # which model powered the run (alias; the launch-time truth)
     ("messages",  "kind",            "TEXT DEFAULT 'fyi'"),
     ("messages",  "requires_action", "INTEGER DEFAULT 0"),
     ("messages",  "supersedes_id",   "INTEGER"),
@@ -279,18 +303,69 @@ def _loads(s, default):
         return default
 
 
+# ── role prompts (standing identity for any role/team) ──────────────────────────────────────
+def _extract_section(md: str, anchor: str) -> str | None:
+    """Return the markdown section whose heading contains `anchor` (case-insensitive), up to
+    the next heading of the same or higher level. Lets one shared doc (e.g. a leadership
+    cabinet file) serve many agents without splitting it into per-role files."""
+    lines = md.splitlines()
+    a = anchor.lower()
+    start = level = None
+    for i, ln in enumerate(lines):
+        m = re.match(r"(#{1,6})\s+(.*)", ln)
+        if m and a in m.group(2).lower():
+            start, level = i, len(m.group(1))
+            break
+    if start is None:
+        return None
+    out = [lines[start]]
+    for ln in lines[start + 1:]:
+        m = re.match(r"(#{1,6})\s", ln)
+        if m and len(m.group(1)) <= level:
+            break
+        out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _load_role_text(spec: str | None) -> str | None:
+    """Resolve a role_prompt spec: comma-separated "path[#heading]" items, paths relative to
+    WORKSPACE unless absolute. Fail-soft: a missing file/section becomes a visible one-line
+    note (the worker + Conductor see the gap) rather than a crashed spawn."""
+    if not spec:
+        return None
+    parts = []
+    for item in (s.strip() for s in spec.split(",")):
+        if not item:
+            continue
+        path, _, anchor = item.partition("#")
+        p = Path(path.strip())
+        if not p.is_absolute():
+            p = WORKSPACE / p
+        try:
+            text = p.read_text()
+        except OSError:
+            parts.append(f"(role prompt source missing: {item})")
+            continue
+        if anchor.strip():
+            text = (_extract_section(text, anchor.strip())
+                    or f"(section '{anchor.strip()}' not found in {p.name})")
+        parts.append(text.strip())
+    return ("\n\n---\n\n".join(parts)) if parts else None
+
+
 # ── v1 worker commands (ported; msg/decide extended) ─────────────────────────────────────────
 def cmd_set(con, a) -> int:
     row = con.execute("SELECT * FROM workstreams WHERE slug=?", (a.slug,)).fetchone()
     cur = dict(row) if row else {
         "slug": a.slug, "owner": None, "layer": None, "state": "ACTIVE", "status_line": None,
         "next": None, "blockers": None, "branch": None, "kestral_id": None, "product": "claude",
-        "model": None, "repo": None, "worktree": None, "session_id": None, "lifetime": "territory"}
+        "model": None, "repo": None, "worktree": None, "session_id": None,
+        "lifetime": "territory", "role_prompt": None}
     for field, val in (("owner", a.owner), ("layer", a.layer), ("state", a.state),
                        ("status_line", a.status), ("next", a.next), ("blockers", a.blockers),
                        ("branch", a.branch), ("product", a.product), ("model", a.model),
                        ("repo", a.repo), ("worktree", a.worktree), ("session_id", a.session_id),
-                       ("lifetime", a.lifetime)):
+                       ("lifetime", a.lifetime), ("role_prompt", a.role_prompt)):
         if val is not None:
             cur[field] = val
     if cur["state"] not in AGENT_STATES:
@@ -299,15 +374,17 @@ def cmd_set(con, a) -> int:
     with write_txn(con):
         con.execute(
             """INSERT INTO workstreams (slug,owner,layer,state,status_line,next,blockers,branch,
-                 kestral_id,product,model,repo,worktree,session_id,lifetime,updated_ts)
+                 kestral_id,product,model,repo,worktree,session_id,lifetime,role_prompt,updated_ts)
                VALUES (:slug,:owner,:layer,:state,:status_line,:next,:blockers,:branch,
-                 :kestral_id,:product,:model,:repo,:worktree,:session_id,:lifetime,:updated_ts)
+                 :kestral_id,:product,:model,:repo,:worktree,:session_id,:lifetime,:role_prompt,
+                 :updated_ts)
                ON CONFLICT(slug) DO UPDATE SET
                  owner=excluded.owner, layer=excluded.layer, state=excluded.state,
                  status_line=excluded.status_line, next=excluded.next, blockers=excluded.blockers,
                  branch=excluded.branch, product=excluded.product, model=excluded.model,
                  repo=excluded.repo, worktree=excluded.worktree, session_id=excluded.session_id,
-                 lifetime=excluded.lifetime, updated_ts=excluded.updated_ts""",
+                 lifetime=excluded.lifetime, role_prompt=excluded.role_prompt,
+                 updated_ts=excluded.updated_ts""",
             {**cur, "updated_ts": now_iso()})
     print(f"✓ updated {a.slug} → {cur['state']}")
     return 0
@@ -654,7 +731,7 @@ def cmd_status(con, a) -> int:
         flag = "  ⚠STALE" if is_stale(r["updated_ts"]) else ""
         blk = f"  ⛔{r['blockers']}" if r["blockers"] and (r["blockers"] or "").lower() != "none" else ""
         print(f"  [{r['state']:>10}] {r['slug']:<30} {r['repo'] or r['layer'] or '-':<20} "
-              f"{ago(r['updated_ts']):>9}{flag}{blk}")
+              f"{r['model'] or '-':<8} {ago(r['updated_ts']):>9}{flag}{blk}")
         if r["next"]:
             print(f"               next: {r['next']}")
     trows = con.execute("SELECT * FROM tasks WHERE state NOT IN ('DONE','PARKED') ORDER BY id").fetchall()
@@ -952,8 +1029,12 @@ def cmd_review_policy(con, a) -> int:
 
 # ── worker runtime (v2): spawn / run / harvest / retire ─────────────────────────────────────
 def _launcher(product: str, starter: str, model: str | None, max_turns: int,
-              permission_mode: str | None, session_id: str | None = None) -> list[str]:
-    """Build the headless CLI invocation. Env overrides let tests fake the binary."""
+              permission_mode: str | None, session_id: str | None = None,
+              system_append: str | None = None) -> list[str]:
+    """Build the headless CLI invocation. Env overrides let tests fake the binary.
+    `system_append` carries the agent's standing role prompt: for claude it rides the system
+    prompt on EVERY invocation (so the role survives resumes and compaction); codex has no
+    equivalent flag, so it's prepended to the prompt on fresh sessions only."""
     if product == "claude":
         binary = os.environ.get("FLEET_LAUNCHER_CLAUDE", "claude")
         cmd = shlex.split(binary)
@@ -963,15 +1044,20 @@ def _launcher(product: str, starter: str, model: str | None, max_turns: int,
             cmd += ["-p", starter]
         cmd += ["--output-format", "json", "--max-turns", str(max_turns)]
         if model:
-            cmd += ["--model", model]
+            cmd += ["--model", _resolve_model(model)]
         if permission_mode:
             cmd += ["--permission-mode", permission_mode]
+        if system_append:
+            cmd += ["--append-system-prompt", system_append]
         return cmd
     binary = os.environ.get("FLEET_LAUNCHER_CODEX", "codex")
     cmd = shlex.split(binary) + ["exec"]
     if session_id:
-        cmd += ["resume", session_id]
-    cmd += ["--json", starter]
+        cmd += ["resume", session_id, "--json", starter]
+    else:
+        prompt = (f"=== YOUR STANDING ROLE ===\n{system_append}\n=== END ROLE ===\n\n{starter}"
+                  if system_append else starter)
+        cmd += ["--json", prompt]
     return cmd
 
 
@@ -1032,7 +1118,13 @@ def _render_starter(con, t, agent_row) -> str:
                      for i, c in enumerate(ctx)) or "  (none listed — the task row is your spec)"
     budget = (f"${t['budget_usd']:.2f} (spent ${t['spent_usd']:.2f})"
               if t["budget_usd"] else "unset — be frugal")
-    L = [
+    role_spec = agent_row["role_prompt"] if "role_prompt" in agent_row.keys() else None
+    L = []
+    if role_spec:
+        L += [f"ROLE: your standing role prompt is loaded from `{role_spec}` and rides your "
+              "system prompt on every session — it defines who you are; this brief defines "
+              "the task.", ""]
+    L += [
         f"You are {slug}, working {t['repo'] or 'the workspace'}"
         + (f":{t['territory']}" if t["territory"] else "") + ".",
         f"Worktree: {agent_row['worktree'] or '(assigned at spawn)'} · branch: "
@@ -1083,7 +1175,8 @@ def cmd_starter(con, a) -> int:
     agent = con.execute("SELECT * FROM workstreams WHERE slug=?", (slug,)).fetchone()
     if not agent:
         # Render against a synthetic row so starter works pre-spawn.
-        agent = {"slug": slug, "model": a.model, "worktree": None, "branch": None}
+        agent = {"slug": slug, "model": a.model, "worktree": None, "branch": None,
+                 "role_prompt": None}
     print(_render_starter(con, t, agent))
     return 0
 
@@ -1118,27 +1211,35 @@ def cmd_spawn(con, a) -> int:
         with write_txn(con):
             con.execute(
                 """INSERT INTO workstreams (slug,state,status_line,branch,product,model,repo,
-                     worktree,lifetime,updated_ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                     worktree,lifetime,role_prompt,updated_ts)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(slug) DO UPDATE SET
-                     branch=excluded.branch, product=excluded.product,
+                     state='ACTIVE', branch=excluded.branch, product=excluded.product,
                      model=COALESCE(excluded.model, workstreams.model), repo=excluded.repo,
-                     worktree=excluded.worktree, updated_ts=excluded.updated_ts""",
+                     worktree=excluded.worktree,
+                     role_prompt=COALESCE(excluded.role_prompt, workstreams.role_prompt),
+                     updated_ts=excluded.updated_ts""",
                 (slug, "ACTIVE", f"spawned for task #{t['id']}", branch, product, a.model,
-                 t["repo"], str(wt) if wt else None, lifetime, now_iso()))
+                 t["repo"], str(wt) if wt else None, lifetime, a.role_prompt, now_iso()))
             con.execute("UPDATE tasks SET owner_slug=?, branch=?, updated_ts=? WHERE id=?",
                         (slug, branch, now_iso(), t["id"]))
         t = _get_task(con, a.task)
     agent = con.execute("SELECT * FROM workstreams WHERE slug=?", (slug,)).fetchone() or \
-        {"slug": slug, "model": a.model, "worktree": str(wt) if wt else None, "branch": branch}
+        {"slug": slug, "model": a.model, "worktree": str(wt) if wt else None, "branch": branch,
+         "role_prompt": a.role_prompt}
+    role_text = _load_role_text(agent["role_prompt"] if "role_prompt" in agent.keys() else None)
     starter = _render_starter(con, t, agent)
-    cmd = _launcher(product, starter, a.model, a.max_turns, a.permission_mode)
+    cmd = _launcher(product, starter, a.model, a.max_turns, a.permission_mode,
+                    system_append=role_text)
     if a.dry_run:
-        shown = " ".join(
-            f"'<starter prompt, {len(c)} chars — see fleet starter --task {t['id']}>'"
-            if c == starter else shlex.quote(c) for c in cmd)
+        def _mask(c):
+            if c == starter:
+                return f"'<starter prompt, {len(c)} chars — see fleet starter --task {t['id']}>'"
+            if role_text and c == role_text:
+                return f"'<role prompt, {len(c)} chars>'"
+            return shlex.quote(c)
         print("DRY RUN — would execute (cwd=" + (str(wt) if wt else "fleet home") + "):")
-        print("  " + shown)
+        print("  " + " ".join(_mask(c) for c in cmd))
         return 0
     if a.no_launch:
         print(f"✓ prepared {slug} (worktree {wt}); launch skipped (--no-launch)")
@@ -1147,14 +1248,17 @@ def cmd_spawn(con, a) -> int:
     out = RUNS_DIR / f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     env = {**os.environ, "FLEET_SLUG": slug, "FLEET_DB": str(DB_PATH),
            "FLEET_TASK": str(t["id"])}
+    launch_model = a.model or (agent["model"] if "model" in agent.keys() else None)
     proc = subprocess.Popen(cmd, cwd=str(wt) if wt else str(FLEET_HOME), env=env,
                             stdout=open(out, "w"), stderr=subprocess.STDOUT,
                             start_new_session=True)
     with write_txn(con):
-        con.execute("""INSERT INTO runs (agent_slug,task_id,product,status,pid,result_ref,started_ts)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (slug, t["id"], product, "running", proc.pid, str(out), now_iso()))
-        _event(con, "conductor", "spawn", f"agent:{slug}", f"task:{t['id']} pid:{proc.pid}")
+        con.execute("""INSERT INTO runs (agent_slug,task_id,product,model,status,pid,result_ref,
+                        started_ts) VALUES (?,?,?,?,?,?,?,?)""",
+                    (slug, t["id"], product, launch_model, "running", proc.pid, str(out),
+                     now_iso()))
+        _event(con, "conductor", "spawn", f"agent:{slug}",
+               f"task:{t['id']} pid:{proc.pid} model:{launch_model or 'default'}")
     print(f"✓ spawned {slug} (pid {proc.pid}, task #{t['id']}) → {out}\n  harvest later: fleet harvest")
     return 0
 
@@ -1177,8 +1281,19 @@ def cmd_run(con, a) -> int:
     if not text:
         print("ERROR: empty --input", file=sys.stderr)
         return 2
+    if a.model and a.model != agent["model"]:
+        # Persistent model switch (works mid-session: --resume + --model re-powers the same
+        # conversation). Logged so the report's per-model numbers stay interpretable.
+        with write_txn(con):
+            con.execute("UPDATE workstreams SET model=?, updated_ts=? WHERE slug=?",
+                        (a.model, now_iso(), a.agent))
+            _event(con, "conductor", "model-switch", f"agent:{a.agent}",
+                   f"{agent['model'] or 'default'} → {a.model}")
+        agent = con.execute("SELECT * FROM workstreams WHERE slug=?", (a.agent,)).fetchone()
+    role_text = _load_role_text(agent["role_prompt"])
     cmd = _launcher(agent["product"] or "claude", text, agent["model"], a.max_turns,
-                    a.permission_mode, session_id=None if a.fresh else agent["session_id"])
+                    a.permission_mode, session_id=None if a.fresh else agent["session_id"],
+                    system_append=role_text)
     cwd = agent["worktree"] if agent["worktree"] and Path(agent["worktree"]).is_dir() else str(FLEET_HOME)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out = RUNS_DIR / f"{a.agent}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
@@ -1186,10 +1301,10 @@ def cmd_run(con, a) -> int:
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=open(out, "w"),
                             stderr=subprocess.STDOUT, start_new_session=True)
     with write_txn(con):
-        con.execute("""INSERT INTO runs (agent_slug,task_id,product,status,pid,result_ref,started_ts)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (a.agent, a.task, agent["product"] or "claude", "running", proc.pid,
-                     str(out), now_iso()))
+        con.execute("""INSERT INTO runs (agent_slug,task_id,product,model,status,pid,result_ref,
+                        started_ts) VALUES (?,?,?,?,?,?,?,?)""",
+                    (a.agent, a.task, agent["product"] or "claude", agent["model"], "running",
+                     proc.pid, str(out), now_iso()))
         _event(con, "conductor", "resume", f"agent:{a.agent}", f"pid:{proc.pid}")
     print(f"✓ resumed {a.agent} (pid {proc.pid}) → {out}")
     return 0
@@ -1454,6 +1569,9 @@ def cmd_report(con, a) -> int:
     by_lane = con.execute(
         """SELECT agent_slug, COALESCE(SUM(cost_usd),0) c, COUNT(*) n FROM runs
            WHERE started_ts>=? GROUP BY agent_slug ORDER BY c DESC""", (cutoff,)).fetchall()
+    by_model = con.execute(
+        """SELECT COALESCE(model,'(default)') m, COALESCE(SUM(cost_usd),0) c, COUNT(*) n
+           FROM runs WHERE started_ts>=? GROUP BY m ORDER BY c DESC""", (cutoff,)).fetchall()
     touches_per = (human_resolved + founder_touches) / shipped if shipped else float("nan")
     print(f"REPORT — last {a.days}d")
     print(f"  tasks shipped: {shipped}")
@@ -1464,6 +1582,43 @@ def cmd_report(con, a) -> int:
     print(f"  spend: ${spend:.2f}")
     for r in by_lane:
         print(f"    {r['agent_slug']:<30} ${r['c']:.2f}  ({r['n']} runs)")
+    if by_model:
+        print("  spend by model:")
+        for r in by_model:
+            print(f"    {r['m']:<30} ${r['c']:.2f}  ({r['n']} runs)")
+    return 0
+
+
+def cmd_models(con, a) -> int:
+    """Model tracking view: the registry, which agents run on what, spend by model."""
+    print("MODEL REGISTRY (alias → launch id; unknown aliases pass through untouched)")
+    for alias, m in MODELS.items():
+        prof = FLEET_HOME / "profiles" / f"{alias}.md"
+        print(f"  {alias:<8} → {m['id']:<30} [{m['tier']:>9}]  "
+              f"profile: {'yes' if prof.exists() else 'NO — add profiles/' + alias + '.md'}")
+    rows = con.execute(
+        "SELECT COALESCE(model,'(default)') m, COUNT(*) n FROM workstreams "
+        "WHERE state != 'PARKED' GROUP BY m ORDER BY n DESC").fetchall()
+    print("\nACTIVE AGENTS by model")
+    for r in rows:
+        agents = [x["slug"] for x in con.execute(
+            "SELECT slug FROM workstreams WHERE COALESCE(model,'(default)')=? AND state!='PARKED'",
+            (r["m"],)).fetchall()]
+        print(f"  {r['m']:<10} {r['n']:>3}  {', '.join(agents)}")
+    spend = con.execute(
+        """SELECT COALESCE(model,'(default)') m, COUNT(*) n, COALESCE(SUM(cost_usd),0) c,
+                  COALESCE(AVG(cost_usd),0) avg_c
+           FROM runs WHERE status IN ('finished','failed') GROUP BY m ORDER BY c DESC""").fetchall()
+    print("\nSPEND by model (all time)")
+    for r in spend:
+        print(f"  {r['m']:<10} ${r['c']:>8.2f}  ({r['n']} runs, avg ${r['avg_c']:.2f})")
+    switches = con.execute(
+        "SELECT * FROM events WHERE action='model-switch' ORDER BY ts DESC LIMIT ?",
+        (a.limit,)).fetchall()
+    if switches:
+        print("\nRECENT SWITCHES")
+        for e in switches:
+            print(f"  {e['ts']}  {e['subject']:<28} {e['detail']}")
     return 0
 
 
@@ -1512,7 +1667,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("set", help="create/update an agent row (atomic, locked)")
     s.add_argument("--slug", required=True)
     for f in ("owner", "layer", "state", "status", "next", "blockers", "branch", "product",
-              "model", "repo", "worktree", "session-id", "lifetime"):
+              "model", "repo", "worktree", "session-id", "lifetime", "role-prompt"):
         s.add_argument(f"--{f}", dest=f.replace("-", "_"))
     s.set_defaults(fn=cmd_set)
 
@@ -1637,6 +1792,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agent"); s.add_argument("--model")
     s.add_argument("--product", choices=PRODUCTS)
     s.add_argument("--lifetime", choices=LIFETIMES)
+    s.add_argument("--role-prompt", help="'path[#heading],…' standing role spec (persists on the agent)")
     s.add_argument("--max-turns", type=int, default=40)
     s.add_argument("--permission-mode", default="acceptEdits")
     s.add_argument("--dry-run", action="store_true")
@@ -1647,6 +1803,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agent", required=True)
     s.add_argument("--input", required=True, help="text, or '-' for stdin")
     s.add_argument("--task", type=int)
+    s.add_argument("--model", help="switch the agent's model (persists; works on resume)")
     s.add_argument("--fresh", action="store_true", help="start a new session instead of resuming")
     s.add_argument("--max-turns", type=int, default=40)
     s.add_argument("--permission-mode", default="acceptEdits")
@@ -1659,6 +1816,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--agent", required=True)
     s.add_argument("--rm-worktree", action="store_true")
     s.set_defaults(fn=cmd_retire)
+
+    s = sub.add_parser("models", help="model registry, per-agent assignment, spend by model")
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(fn=cmd_models)
 
     s = sub.add_parser("digest", help="the Conductor's one-call gather")
     s.add_argument("--json", action="store_true")
