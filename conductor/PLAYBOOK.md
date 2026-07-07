@@ -147,6 +147,36 @@ Customer Research (retreat-clocked) → Chief Architect → Data & Telemetry →
 duties activate in you) → Eval Science → Design. Media Intelligence stays PARKED until the
 quality wave.
 
+## Task-writing rules (turn economics — learned 2026-07-07, ~60 runs)
+
+Turn caps are almost never "the model couldn't do it" — in every cap-hit autopsied on
+2026-07-07 the work was substantially done and the turns went to orientation, environment
+discovery, and wrap-up. Three rules that attack the actual causes:
+
+1. **One task = one deliverable.** A packed objective (task #26: owner-pays + quota removal
+   + member caps + raise-a-decision, in one task) multiplies orientation cost and hit the cap
+   twice; the single-purpose ephemerals filed the same day (#33 ledger fix, #48 covers) ran
+   clean first-try. If your objective contains two feature names, file two tasks.
+2. **Brief-first has a trigger, not a blanket.** Natural experiment, same day: the music work
+   went charter → CA co-sign with binding conditions → implementation, and T-M2 built in ONE
+   run with a clear-for-merge review. The billing work went straight to implementation on a
+   packed objective: turn-capped, discovered a cross-repo gap mid-build, took two review
+   cycles. Specification turns are cheaper than implementation turns and are spent by
+   judgment-tier models instead of burned by a wandering implementer.
+   **Trigger: design forks, schema/contract surface, or anything crossing repos gets a
+   spec'd seam (brief section or co-sign) BEFORE spawn. Single-file mechanical fixes with a
+   falsifiable done-criterion never do** (the watermark fix needed no brief).
+3. **Environment pack in every starter.** Agents burn early turns discovering venv paths,
+   test commands, and worktree layout. The task context should carry: exact test command
+   (worktree-relative), venv location, and the 3-5 files that matter. Also: **commit early,
+   commit often** is in the starter protocol because a cap-hit with uncommitted work loses
+   the tail (5 runs lost work this way before the rule).
+
+Conductor-side hygiene that costs gates when skipped: an agent row without a registered
+`worktree` makes `fleet verify` run from the wrong cwd and bounce VALID evidence (4 separate
+incidents on 2026-07-07 before the fleet.py fix). Until you're on a build with the fix,
+set `--worktree` at registration and check it before the first verify.
+
 ## Model strategy
 
 You own model assignment for the fleet (`fleet models` is your view: registry, per-agent
@@ -169,8 +199,25 @@ assignment, spend by model, recent switches). Agents store the ALIAS (`sonnet`/`
   turns is cheaper AND faster despite the per-token premium. Leadership/review stays Fable.
 - Profiles are load-bearing: the starter injects `profiles/<alias>.md`, so keep each model's
   known failure modes current as DISCOVERIES land (Opus tail-drop, S5 temperature rejection…).
+- **Why the tiers differ (2026-07-07 evidence): step granularity.** Sonnet reaches the same
+  destination in many small read-edit-test steps; Opus plans multi-file changes and executes
+  in fewer, larger moves — 2-3x fewer turns on complex implements, which made Opus cheaper
+  AND faster despite the per-token premium. Budget turns, not just tokens, when assigning.
+- **Leadership-on-Opus experiment (founder-approved 2026-07-07): selectively run leadership
+  SEATS on Opus when the task is well-specified and judgment-light** — reviews with a crisp
+  rubric and named dimensions, conformance checks against an existing ruling, gate-verifiable
+  doc tasks with mechanical done-criteria. Keep Fable for: open-ended rulings, first-of-kind
+  contract seams, anything that SETS precedent rather than checks against it, and final
+  pre-prod review. Mechanics: per-task override (`fleet run --agent X --model opus`), never
+  silently — the switch is logged; watch bounce-rate and REQUEST-CHANGES quality by model in
+  `fleet report` and re-tier on evidence. The bet being tested: specification quality
+  (Fable-written briefs/rubrics) substitutes for judgment tier at execution time.
 
 ## Standing rules
+- **Merges (founder delegation 2026-07-07): the Conductor merges a PR once it is
+  evidence-verified AND its required review posts clearance** — do not queue merge-ready PRs
+  on the founder. Prod DB migrations remain a separate step (manual via the SSM tunnel) and
+  their TIMING is confirmed with the founder even when the merge isn't.
 - Never run or verify anything in a primary checkout — worker worktrees only (`fleet verify`
   does this for you; don't hand-roll).
 - Never mark DONE on a self-report. Never skip the territory-overlap refusal with --force
