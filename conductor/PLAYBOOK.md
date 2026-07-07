@@ -52,9 +52,12 @@ contract seam, (d) owner context saturation. Ephemeral agents get retired
 
 ### 4. Gate (claims are leads; verified evidence is the gate)
 For each gate request:
-1. `fleet verify --task N` — re-runs the claimed test_cmd in the WORKER's worktree. Or, if the
-   claim is a CI URL, `gh run view <url>` and use `--force` on set-state to accept CI as the
-   verifier (say so in the event note).
+1. `fleet verify --task N` — re-runs the claimed test_cmd in the OWNER's registered worktree,
+   full stop (multi-repo territories included: sibling repos are reached relative to it). If it
+   exits 2 the worktree registration is empty/missing — fix the row (`fleet set --slug <owner>
+   --worktree <path>`; spawn persists it automatically), do NOT hand-run the cmd from the fleet
+   dir. Or, if the claim is a CI URL, `gh run view <url>` and use `--force` on set-state to
+   accept CI as the verifier (say so in the event note).
 2. `fleet review-policy --task N --diff-lines $(gh pr diff <n> | wc -l)` — if tier1_required,
    create the review task NOW (author is NOT blocked; only the merge is):
    `fleet task add --kind review --objective "review task #N: <objective>" --depends N

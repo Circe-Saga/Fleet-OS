@@ -969,7 +969,13 @@ def cmd_task_set_state(con, a) -> int:
 
 
 def cmd_verify(con, a) -> int:
-    """Conductor gate: re-run the claimed test_cmd in the OWNER'S worktree. Exit 0 → verified."""
+    """Conductor gate: re-run the claimed test_cmd in the OWNER'S worktree — full stop.
+
+    There is deliberately NO fallback cwd (fleet dir, primary checkout): evidence run anywhere
+    but the owner's registered worktree bounces valid gates (task #50 — 8 hand-fixed rows in
+    one day). Multi-repo territories: still the owner's worktree; evidence cmds reference
+    sibling repos relative to it (../../<Repo>/…). Config errors exit 2, distinct from a real
+    gate bounce (exit 1)."""
     t = _get_task(con, a.id)
     if not t:
         print(f"ERROR: no task #{a.id}", file=sys.stderr)
@@ -982,12 +988,25 @@ def cmd_verify(con, a) -> int:
         return 2
     owner = con.execute("SELECT * FROM workstreams WHERE slug=?", (t["owner_slug"],)).fetchone() \
         if t["owner_slug"] else None
-    cwd = None
-    if owner and owner["worktree"] and Path(owner["worktree"]).is_dir():
-        cwd = owner["worktree"]
-    elif t["repo"] and (WORKSPACE / t["repo"]).is_dir():
-        cwd = str(WORKSPACE / t["repo"])
-        print(f"⚠ no worker worktree on record — verifying in primary checkout {cwd}", file=sys.stderr)
+    if not owner:
+        print(f"ERROR: task #{a.id} has no registered owner agent — verify re-runs evidence in "
+              f"the OWNER's worktree, full stop (never the fleet dir or a primary checkout). "
+              f"Assign an owner (fleet task assign --id {a.id} --owner <slug>), then register "
+              f"its worktree (fleet spawn persists it; or fleet set --slug <slug> --worktree "
+              f"<path>).", file=sys.stderr)
+        return 2
+    if not owner["worktree"]:
+        print(f"ERROR: agent {owner['slug']} has no worktree on record — refusing to run "
+              f"evidence from {FLEET_HOME} (that is exactly how valid gates bounce). Fix: "
+              f"fleet set --slug {owner['slug']} --worktree <path>  (fleet spawn persists this "
+              f"automatically).", file=sys.stderr)
+        return 2
+    if not Path(owner["worktree"]).is_dir():
+        print(f"ERROR: registered worktree {owner['worktree']} for agent {owner['slug']} is "
+              f"missing on disk — recreate it (fleet spawn --task {a.id}) or re-register "
+              f"(fleet set --slug {owner['slug']} --worktree <path>).", file=sys.stderr)
+        return 2
+    cwd = owner["worktree"]
     try:
         proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True,
                               timeout=a.timeout)
@@ -1081,6 +1100,21 @@ def _launcher(product: str, starter: str, model: str | None, max_turns: int,
 
 def _worktree_for(slug: str, repo: str) -> Path:
     return WORKTREES / f"{slug}--{repo}"
+
+
+def _territory_repo(territory: str | None) -> str | None:
+    """Resolve the owning repo from a task's territory ('Repo:paths[,Repo2:paths,…]').
+
+    In practice tasks rarely carry --repo; the territory prefix is the source of truth. The
+    segment before the FIRST ':' wins when it names a git checkout under WORKSPACE. Multi-repo
+    territories: the first-listed repo is the OWNER's — spawn creates (and verify runs in) the
+    owner's worktree, full stop; cmds touching sibling repos are written relative to it."""
+    if not territory or ":" not in territory:
+        return None
+    name = territory.split(":", 1)[0].strip()
+    if name and "/" not in name and (WORKSPACE / name / ".git").exists():
+        return name
+    return None
 
 
 def _ensure_worktree(repo: str, slug: str, branch: str) -> Path:
@@ -1218,13 +1252,26 @@ def cmd_spawn(con, a) -> int:
               file=sys.stderr)
         return 2
     branch = t["branch"] or f"agent/{slug}/t{t['id']}"
+    existing = con.execute("SELECT * FROM workstreams WHERE slug=?", (slug,)).fetchone()
+    repo = t["repo"] or (existing["repo"] if existing else None) or _territory_repo(t["territory"])
+    registered = existing["worktree"] if existing and existing["worktree"] else None
     wt = None
-    if t["repo"]:
+    if registered and Path(registered).is_dir():
+        wt = Path(registered)   # registration wins — spawn never clobbers `fleet set --worktree`
+    elif repo:
+        if registered:
+            print(f"⚠ registered worktree {registered} is gone from disk; recreating at the "
+                  f"standard path", file=sys.stderr)
         if a.dry_run:
-            wt = _worktree_for(slug, t["repo"])
+            wt = _worktree_for(slug, repo)
         else:
-            wt = _ensure_worktree(t["repo"], slug, branch)
+            wt = _ensure_worktree(repo, slug, branch)
             _write_worker_settings(wt)
+    else:
+        print(f"⚠ no worktree resolvable for {slug}: task #{t['id']} has no repo and territory "
+              f"'{t['territory'] or ''}' names none — worker will run in the fleet home and "
+              f"`fleet verify` will REFUSE the gate until one is registered "
+              f"(fleet set --slug {slug} --worktree <path>)", file=sys.stderr)
     # upsert the agent row first so the starter renders with worktree/branch filled in
     lifetime = a.lifetime or ("ephemeral" if not t["owner_slug"] else "territory")
     if not a.dry_run:
@@ -1235,12 +1282,13 @@ def cmd_spawn(con, a) -> int:
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(slug) DO UPDATE SET
                      state='ACTIVE', branch=excluded.branch, product=excluded.product,
-                     model=COALESCE(excluded.model, workstreams.model), repo=excluded.repo,
-                     worktree=excluded.worktree,
+                     model=COALESCE(excluded.model, workstreams.model),
+                     repo=COALESCE(excluded.repo, workstreams.repo),
+                     worktree=COALESCE(excluded.worktree, workstreams.worktree),
                      role_prompt=COALESCE(excluded.role_prompt, workstreams.role_prompt),
                      updated_ts=excluded.updated_ts""",
                 (slug, "ACTIVE", f"spawned for task #{t['id']}", branch, product, a.model,
-                 t["repo"], str(wt) if wt else None, lifetime, a.role_prompt, now_iso()))
+                 repo, str(wt) if wt else None, lifetime, a.role_prompt, now_iso()))
             con.execute("UPDATE tasks SET owner_slug=?, branch=?, updated_ts=? WHERE id=?",
                         (slug, branch, now_iso(), t["id"]))
         t = _get_task(con, a.task)
@@ -1314,7 +1362,13 @@ def cmd_run(con, a) -> int:
     cmd = _launcher(agent["product"] or "claude", text, agent["model"], a.max_turns,
                     a.permission_mode, session_id=None if a.fresh else agent["session_id"],
                     system_append=role_text)
-    cwd = agent["worktree"] if agent["worktree"] and Path(agent["worktree"]).is_dir() else str(FLEET_HOME)
+    if agent["worktree"] and Path(agent["worktree"]).is_dir():
+        cwd = agent["worktree"]
+    else:
+        cwd = str(FLEET_HOME)
+        print(f"⚠ {a.agent} has no usable worktree on record — resuming in the fleet home; "
+              f"register one (fleet set --slug {a.agent} --worktree <path>) before gating its "
+              f"work", file=sys.stderr)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out = RUNS_DIR / f"{a.agent}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
     env = {**os.environ, "FLEET_SLUG": a.agent, "FLEET_DB": str(DB_PATH)}

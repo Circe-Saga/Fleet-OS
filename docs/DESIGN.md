@@ -271,6 +271,14 @@ fleet tick        # deterministic gather → Conductor reasons → actions → e
    `evidence.test_cmd` in the worker's worktree (or checks `ci_url` via `gh run view`) and only
    then sets `verified_by_conductor`. Sincere-but-wrong "my tests pass" is expected LLM
    behavior, not an anomaly; the design assumes it.
+   The cwd contract (task #50): `fleet verify` runs in the OWNER's registered worktree
+   (`workstreams.worktree`), **full stop** — no fallback to the fleet dir or a primary
+   checkout; an empty/missing registration is an exit-2 config error with the remedy printed,
+   never a gate bounce. `fleet spawn` persists the worktree it creates or reuses onto the
+   agent row (repo resolved from the task's `--repo`, the agent row, or the territory's
+   `Repo:` prefix, in that order) and never clobbers a `fleet set --worktree` registration.
+   Multi-repo territories: the first-listed repo is the owner's; evidence cmds reference
+   sibling repos relative to the owner's worktree (`../../<Repo>/…`).
 6. **Escalate** — regenerate `WAITING_ON_YOU.md`; auto-resolve expired reversible decisions to
    their default (logged, reported); push-notify only `authorization` and prod-deploy items.
 7. Every action → one `events` row. The founder samples the event log weekly; any worker may
