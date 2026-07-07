@@ -71,6 +71,13 @@ class FleetCase(unittest.TestCase):
         r = self.fleet(*args)
         return int(r.stdout.split("#")[1].split(" ")[0])
 
+    def register_worktree(self, slug):
+        """Real dir + agent row: verify refuses to run anywhere but a registered worktree."""
+        wt = self.workspace / ".worktrees" / f"{slug}--wt"
+        wt.mkdir(parents=True, exist_ok=True)
+        self.fleet("set", "--slug", slug, "--worktree", str(wt))
+        return wt
+
 
 class TestSchema(FleetCase):
     def test_idempotent_connect(self):
@@ -110,7 +117,8 @@ class TestTaskGates(FleetCase):
         self.assertIn("workers propose", r.stderr)
 
     def test_conductor_needs_verified_evidence(self):
-        tid = self.add_task()
+        tid = self.add_task(owner="lane-w")
+        self.register_worktree("lane-w")
         self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
                    "--actor", "conductor")
         r = self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_REVIEW",
@@ -122,7 +130,8 @@ class TestTaskGates(FleetCase):
                    "--actor", "conductor")                             # now granted
 
     def test_failed_verify_bounces(self):
-        tid = self.add_task()
+        tid = self.add_task(owner="lane-w")
+        self.register_worktree("lane-w")
         self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "false")
         r = self.fleet("verify", "--task", str(tid), expect=1)
         self.assertIn("GATE BOUNCE", r.stdout)
@@ -132,7 +141,8 @@ class TestTaskGates(FleetCase):
         self.assertIn("gate-bounce", actions)
 
     def test_new_claim_invalidates_verification(self):
-        tid = self.add_task()
+        tid = self.add_task(owner="lane-w")
+        self.register_worktree("lane-w")
         self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
         self.fleet("verify", "--task", str(tid))
         self.fleet("task", "evidence", "--id", str(tid), "--pr", "#99")  # new claim
@@ -140,7 +150,8 @@ class TestTaskGates(FleetCase):
         self.assertNotIn("verified_by_conductor", ev)
 
     def test_open_review_blocks_done(self):
-        tid = self.add_task()
+        tid = self.add_task(owner="lane-w")
+        self.register_worktree("lane-w")
         self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
         self.fleet("verify", "--task", str(tid))
         rid = self.add_task(objective="review it", kind="review", depends=str(tid))
@@ -293,6 +304,42 @@ class TestRunner(FleetCase):
                                ["spent_usd"], 1.25)
         out2 = self.fleet("harvest").stdout    # idempotent: nothing left to ingest
         self.assertIn("(no running sessions)", out2)
+
+    def test_spawn_persists_worktree_on_agent_row(self):
+        repo = self.scratch_repo()
+        tid = self.add_task(repo=repo)
+        self.fleet("spawn", "--task", str(tid), "--agent", "lane-x", "--no-launch")
+        row = self.q("SELECT repo, worktree FROM workstreams WHERE slug='lane-x'")[0]
+        self.assertEqual(row["worktree"],
+                         str(self.workspace / ".worktrees" / f"lane-x--{repo}"))
+        self.assertEqual(row["repo"], repo)
+
+    def test_spawn_derives_repo_from_territory(self):
+        # the common shape in practice: --repo empty, territory 'Repo:paths,…'
+        repo = self.scratch_repo()
+        tid = self.add_task(territory=f"{repo}:src/**,tests/**")
+        self.fleet("spawn", "--task", str(tid), "--agent", "lane-t", "--no-launch")
+        wt = self.workspace / ".worktrees" / f"lane-t--{repo}"
+        self.assertTrue(wt.is_dir(), "worktree created from territory-derived repo")
+        row = self.q("SELECT repo, worktree FROM workstreams WHERE slug='lane-t'")[0]
+        self.assertEqual((row["repo"], row["worktree"]), (repo, str(wt)))
+
+    def test_spawn_does_not_clobber_registered_worktree(self):
+        repo = self.scratch_repo()
+        pinned = self.workspace / "pinned-wt"
+        pinned.mkdir()
+        self.fleet("set", "--slug", "lane-r", "--worktree", str(pinned))
+        tid = self.add_task(repo=repo)
+        self.fleet("spawn", "--task", str(tid), "--agent", "lane-r", "--no-launch")
+        row = self.q("SELECT worktree FROM workstreams WHERE slug='lane-r'")[0]
+        self.assertEqual(row["worktree"], str(pinned))
+
+    def test_spawn_warns_when_no_worktree_resolvable(self):
+        tid = self.add_task(territory="docs-only-notes")   # no repo prefix anywhere
+        r = self.fleet("spawn", "--task", str(tid), "--agent", "lane-n", "--no-launch")
+        self.assertIn("no worktree resolvable", r.stderr)
+        row = self.q("SELECT worktree FROM workstreams WHERE slug='lane-n'")[0]
+        self.assertIsNone(row["worktree"])
 
     def test_run_refused_while_running(self):
         self.fleet("set", "--slug", "lane-x", "--state", "ACTIVE", "--session-id", "sess-1")
@@ -500,7 +547,8 @@ class TestKestral(FleetCase):
 
 class TestVerifyRace(FleetCase):
     def test_reclaim_mid_verify_discards_result(self):
-        tid = self.add_task()
+        tid = self.add_task(owner="lane-w")
+        self.register_worktree("lane-w")
         # claim a slow command that re-claims evidence WHILE verify is running it
         reclaim = (f"{PY} {FLEET} task evidence --id {tid} --test-cmd true >/dev/null 2>&1")
         self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", f"sh -c '{reclaim}'")
@@ -509,6 +557,37 @@ class TestVerifyRace(FleetCase):
         ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
         self.assertNotIn("verified_by_conductor", ev)  # stale claim never got stamped
         self.assertIn("gate-stale", [e["action"] for e in self.q("SELECT action FROM events")])
+
+
+class TestVerifyWorktreeGuard(FleetCase):
+    """verify runs in the OWNER's registered worktree, full stop — config gaps exit 2 with a
+    remedy instead of silently running from the fleet dir and bouncing valid gates (task #50)."""
+
+    def test_verify_refuses_empty_worktree(self):
+        tid = self.add_task(owner="lane-w")
+        self.fleet("set", "--slug", "lane-w", "--state", "ACTIVE")   # row exists, worktree empty
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
+        r = self.fleet("verify", "--task", str(tid), expect=2)
+        self.assertIn("no worktree on record", r.stderr)
+        self.assertIn("fleet set --slug lane-w --worktree", r.stderr)   # remedy is actionable
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertNotIn("verified_by_conductor", ev)
+        self.assertNotIn("gate-bounce",           # config error, not a bounce
+                         [e["action"] for e in self.q("SELECT action FROM events")])
+
+    def test_verify_refuses_missing_worktree_dir(self):
+        tid = self.add_task(owner="lane-w")
+        gone = self.workspace / ".worktrees" / "lane-w--gone"        # registered, never created
+        self.fleet("set", "--slug", "lane-w", "--worktree", str(gone))
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
+        r = self.fleet("verify", "--task", str(tid), expect=2)
+        self.assertIn("missing on disk", r.stderr)
+
+    def test_verify_refuses_ownerless_task(self):
+        tid = self.add_task()
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
+        r = self.fleet("verify", "--task", str(tid), expect=2)
+        self.assertIn("OWNER's worktree", r.stderr)
 
 
 class TestReviewPolicy(FleetCase):
