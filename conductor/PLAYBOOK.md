@@ -163,6 +163,10 @@ assignment, spend by model, recent switches). Agents store the ALIAS (`sonnet`/`
   is logged as a `model-switch` event).
 - **De-escalate too:** watch `fleet report`'s spend-by-model; a frontier model coasting
   through routine tasks is budget the review tier isn't getting.
+- **Founder directive (2026-07-06): Opus is the DEFAULT for implementation lanes**; reserve
+  Sonnet for genuinely simple/mechanical tasks (env wiring, small config edits). Evidence:
+  Sonnet lanes hit the turn cap 4× in one day on complex implements — Opus finishing in fewer
+  turns is cheaper AND faster despite the per-token premium. Leadership/review stays Fable.
 - Profiles are load-bearing: the starter injects `profiles/<alias>.md`, so keep each model's
   known failure modes current as DISCOVERIES land (Opus tail-drop, S5 temperature rejection…).
 
