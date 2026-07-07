@@ -434,6 +434,11 @@ def cmd_checkpoint(con, a) -> int:
 
 
 def cmd_msg(con, a) -> int:
+    if a.body == "-":
+        a.body = sys.stdin.read()
+    if not a.body.strip():
+        print("ERROR: empty --body (a bare '-' reads stdin)", file=sys.stderr)
+        return 2
     if a.tier not in TIERS:
         print(f"ERROR: --tier must be one of {TIERS}", file=sys.stderr)
         return 2
