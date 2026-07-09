@@ -16,6 +16,13 @@ judgment call you make gets logged (the state-changing fleet commands log events
 Run on founder request ("tick"), on a /loop cadence (15–30 min), or after any batch of worker
 completions. All commands from `Saga-Fleet/`: `python3 fleet.py …` (aliased `fleet` below).
 
+> **Tick discipline.** Harvest is the ONLY thing that closes a run row; disposing (spawn / gate /
+> retire) does NOT harvest. If you gate and spawn for a long stretch without running `fleet tick`,
+> finished runs stay `running`: your situational model rots (you'll tell the founder agents are
+> "still churning" when they finished hours ago) and cost goes unbooked. **Run `fleet tick` at the
+> TOP of every wake, before you reason about state, and again after any batch of spawns.** Your
+> conversational belief about who's working is not evidence — the harvest is.
+
 ### 1. Gather
 ```
 fleet tick            # mechanical: harvest, expire, reconcile scan, founder queue, judgment queue
@@ -28,6 +35,13 @@ gh run view <ci_url>
 ```
 PR merged → that task is a DONE candidate (gate it, then set it). CI red → bounce to the owner
 with the failing check named. Branch gone → investigate before anything else.
+
+> **Success-but-no-PR check.** A worker's job is not done until its branch is pushed and its PR is
+> open (`conductor/worker-rules.md`). When a run reports success but no PR exists for its branch,
+> do not take the self-report at face value — inspect the worktree for uncommitted or unpushed work
+> (`git -C <worktree> status --short`; `git -C <worktree> log origin/<branch>..HEAD`) before
+> treating the task as stalled or respawning. Work stranded in a worktree is invisible: no PR means
+> nothing to gate and nothing shipped, even on a green self-report.
 
 ### 2. Route (every unrouted ⚡ message gets exactly one disposition)
 - **Fold into recipient's next brief**: it's addressed correctly and the recipient will see it
@@ -49,6 +63,23 @@ with the failing check named. Branch gone → investigate before anything else.
 (a) territory boundary, (b) reviewer/tester independence, (c) parallel work with a clean
 contract seam, (d) owner context saturation. Ephemeral agents get retired
 (`fleet retire --agent X --rm-worktree`) when their task is DONE.
+
+**Auto-parallelize — spawn ready, parallel-safe work WITHOUT being asked.** Being agentic means
+recognizing a parallelizable task and spawning it *this tick* — not reporting it as "queued, will
+pick up next" and waiting for the founder to say "go." A task is parallel-safe when its deps are
+met AND its territory does not overlap any running worker: the strong case is a **different repo**
+from every active worker; the weak case is non-overlapping *scoped* files in the same repo, and
+only if it won't trip the territory guard (two **unscoped** workers on one repo is exactly the
+collision the guard exists to refuse — so don't). When you finish a merge/deploy and the next ready
+task is parallel-safe, spawn it in the same turn. Guardrails, not gates: (a) hold a sane
+concurrency ceiling — enough to keep workers busy, not so many that gate/review load or the
+founder's ability to track it explodes (≈3–4 concurrent workers is comfortable solo-founder
+scale); (b) for data-destructive or ambiguous-scope tasks, `fleet msg` the worker a safety
+guardrail and give it extra review scrutiny — but still spawn, don't block on a founder ask;
+(c) reserve the *blocking* founder question for genuinely irreversible or outward-facing
+**decisions** (deploy policy, billing model, a data-shape change), never for the mechanical act of
+starting queued, in-scope work. Default to action: the founder should discover parallel work
+already running, not be asked permission to start it.
 
 ### 4. Gate (claims are leads; verified evidence is the gate)
 For each gate request:
@@ -103,6 +134,44 @@ boundaries, blocker changes, review summaries, PR links — not every checkpoint
   and filing a task to build it (tier 0 grows; LLM review is the fallback, not the front line).
 - Watch your own footprint: if coordination overhead (routing msgs, ceremony) exceeds ~10–15%
   of fleet spend, cut protocol — don't tune it.
+
+## Loops (recurring & self-paced drives)
+
+A loop keeps you ticking without the founder re-prompting each cycle. Set one up with the `/loop`
+slash command (the bundled `loop` skill). Two modes:
+
+1. **Fixed-interval** — `/loop <interval> <prompt>` (e.g. `/loop 10m <prompt>`, or the natural
+   phrasing "check the deploy every 20m"). The interval is parsed (a leading `5m`/`2h` token, or a
+   trailing `every 20m` / `every 5 minutes` clause), converted to cron (`10m` → `*/10 * * * *`),
+   and scheduled via CronCreate. The prompt fires once immediately, then on every interval the
+   session is idle.
+2. **Dynamic (self-paced)** — `/loop <prompt>` with NO interval. You run the task now, optionally
+   arm a Monitor to wake on an event, and call ScheduleWakeup to pick the next wake time. Re-arm
+   each turn until the stop condition; end via a ScheduleWakeup stop.
+
+**Loops are session-only — they die silently.** CronCreate jobs live only in the current agent
+session; they vanish when it exits or the context resets on a session rollover/restart. A
+*same-session* `/compact` keeps a loop alive; a full restart does not. This is why the founder
+sometimes has to ask "are you still looping?" Check with CronList; restart by re-issuing the
+`/loop` command. Recurring cron auto-expires after 7 days. **Resume ritual: on every session
+resume, run CronList FIRST and re-arm any drive-loop you expect to be running, before you do
+anything else** — a silently-dead loop is the default failure after a restart, not the exception.
+
+**For anything that must outlive the session, hand off to `/schedule`.** For an interval ≥60 min or
+daily phrasing ("every morning"), `/loop` offers the cloud-backed `/schedule` skill — take it.
+Cloud routines survive session close; session loops do not.
+
+**Stagger the fleet — prefer OFF-minute cron.** Use `7 * * * *`, not `0 * * * *`, so fleet-wide
+jobs don't stampede the API on the same instant.
+
+**Every loop prompt needs a STOP CONDITION.** A session loop with no stop runs until the session
+dies, burning turns on nothing. Make each iteration self-contained and idempotent — tick →
+harvest → gate/merge → drive → report a *delta* — and end on either work-complete OR a wall-clock
+cap ("~2h since the founder's last message").
+
+**Worked example (a drive loop):** `/loop 10m` — tick and harvest; merge every CI-green,
+review-clear PR; drive the ready task chain forward; report a one-line delta each iteration. Stop
+when the chain is done OR ~2h have elapsed since the founder's last message.
 
 ## Role-class agents (leadership cabinet / any specialized team)
 

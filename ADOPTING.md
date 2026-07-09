@@ -46,6 +46,10 @@ headless sessions**, so your existing CLI auth (subscription or key) is the only
   auto-proceeds; irreversible never does. Your judgment queue drains itself.
 - **Worktree isolation.** Every worker gets `.worktrees/<agent>--<repo>` off `origin/main` on
   branch `agent/<slug>/t<N>`; territory overlap between in-flight tasks is refused at spawn.
+- **Push before you report.** A worker commits, pushes, and opens its PR (draft if it still needs
+  a gate) *before* recording evidence or messaging the Conductor — work stranded uncommitted in a
+  worktree is invisible. That plus the "worker never drives a shared/human-owned/non-headless
+  resource — it hands the gatekeeper a manual-check note" rule live in `conductor/worker-rules.md`.
 
 ## Design rationale
 
