@@ -6,3 +6,4 @@ STATUS.md
 __pycache__/
 *.pyc
 .env
+.DS_Store

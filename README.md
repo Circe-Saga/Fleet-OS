@@ -22,6 +22,7 @@ hooks/                    # SessionStart brief-inject · Stop checkpoint-guard �
 templates/worker-settings.json   # hook wiring stamped into each worker worktree by `spawn`
 profiles/<model>.md       # model gotchas, curated from DISCOVERIES → injected into starters
 conductor/PLAYBOOK.md     # the Conductor's tick procedure
+conductor/worker-rules.md # generic worker rules (finish protocol · shared-resource gate)
 tests/                    # unittest suite (fake launcher; scratch git repos; tmp DB)
 ```
 
