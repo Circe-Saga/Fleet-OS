@@ -1,8 +1,8 @@
-# Saga Agent OS — Design
+# Agent OS — Design
 
 **Status:** PROPOSED (2026-07-06) · **Author:** Claude (Fable 5, design review session) ·
-**Decision owner:** Jacky (sonderswift) ·
-**Supersedes-in-part:** `Saga-EvalLab/docs/FLEET_COORDINATION_DESIGN.md` (the state layer there
+**Decision owner:** the founder ·
+**Supersedes-in-part:** the v1 fleet-coordination design (the state layer there
 survives intact; this doc adds the layers above it and promotes the system to workspace scope).
 
 > One-line thesis: **the fleet's state layer already works; what was missing is a driver.**
@@ -121,7 +121,7 @@ the Conductor.
 
 ### 4.1 State layer — fleet.db v2 (delta, not rewrite)
 
-Home moves to workspace scope: `Circe-Saga/Saga-Fleet/fleet.db` (see §14). Existing tables
+Home moves to workspace scope: `<workspace>/Fleet-OS/fleet.db` (see §14). Existing tables
 (`workstreams`, `messages`, `decisions`, `updates`, `read_state`) survive; deltas:
 
 ```sql
@@ -134,7 +134,7 @@ CREATE TABLE tasks (
   state         TEXT NOT NULL DEFAULT 'QUEUED' CHECK (state IN
                   ('QUEUED','IN_PROGRESS','IN_REVIEW','BLOCKED','NEEDS_HUMAN','DONE','PARKED')),
   owner_slug    TEXT,                      -- agent slug; NULL = unassigned
-  repo          TEXT,                      -- e.g. 'Saga-FastAPI'
+  repo          TEXT,                      -- e.g. 'acme-api'
   territory     TEXT,                      -- path globs within repo; Conductor enforces no
                                            -- overlap between concurrently IN_PROGRESS tasks
   branch        TEXT,
@@ -198,7 +198,7 @@ CREATE TABLE events (
 
 Deliberately **absent** (v1 review conclusions, held): `context_packets` (generated views, never
 stored — they rot), `artifacts` (GitHub is queried live), `capability_profiles` (markdown:
-`Saga-Fleet/profiles/<model>.md`, sourced from DISCOVERIES entries), `handoffs`/`blockers`/
+`Fleet-OS/profiles/<model>.md`, sourced from DISCOVERIES entries), `handoffs`/`blockers`/
 `spawn_requests` as tables (they are message kinds / task rows). Every column above has a named
 consumer in §4.2–4.6; anything unconsumed after two weeks of operation gets dropped.
 
@@ -217,7 +217,7 @@ never a primary checkout; the workspace's standing gotcha (stale lane branches w
 agents' WIP in primary trees) becomes structurally impossible —
 
 ```
-git -C Circe-Saga/<repo> worktree add ../.worktrees/<slug>--<repo> -b <branch> origin/main
+git -C <workspace>/<repo> worktree add ../.worktrees/<slug>--<repo> -b <branch> origin/main
 ```
 
 then render the starter prompt (§4.6) and launch headless:
@@ -343,7 +343,7 @@ DONE means: <done_criteria — falsifiable>
 DO NOT touch: <dont_touch>
 MUST read first (complete list — nothing else is addressed to you):
   1. <pointer + one line why>  …
-Model notes for you: <2–3 lines from Saga-Fleet/profiles/<model>.md>
+Model notes for you: <2–3 lines from Fleet-OS/profiles/<model>.md>
 Protocol (hook-enforced; listed so you know): checkpoint before every stop; blockers via
   `fleet msg --kind request --requires-action`; propose decisions WITH a default.
 Escalation: repo/docs → context above → owning agent (fleet msg) → Conductor → proposed
@@ -414,11 +414,11 @@ being hand-copied into prompts more than weekly). Schema follows pain, never ant
 
 ## 10. Home & migration
 
-New tiny repo **`Circe-Saga/Saga-Fleet/`** (git init; versioned, unlike the workspace root):
+New tiny repo **`<workspace>/Fleet-OS/`** (git init; versioned, unlike the workspace root):
 
 ```
-Saga-Fleet/
-  fleet.py            # ported from Saga-EvalLab/evals/scripts/fleet.py + v2 deltas
+Fleet-OS/
+  fleet.py            # ported from acme-evallab/evals/scripts/fleet.py + v2 deltas
   fleet.db            # gitignored; THE workspace record
   runs/               # gitignored; captured worker JSON outputs
   profiles/<model>.md # capability notes, curated from DISCOVERIES
@@ -435,7 +435,7 @@ EvalLab's fleet keeps running as-is during the transition; its DB seeds the work
 
 | # | Brief | Delivers | Depends on |
 |---|---|---|---|
-| F0 | `F0-fleet-v2-schema-and-cli.md` | Saga-Fleet repo, schema v2, task/digest/starter/decide-v2 commands | — |
+| F0 | `F0-fleet-v2-schema-and-cli.md` | Fleet-OS repo, schema v2, task/digest/starter/decide-v2 commands | — |
 | F1 | `F1-worker-runner.md` | spawn/run/harvest, worktrees, session ledger, cross-product launchers | F0 |
 | F2 | `F2-conductor-playbook.md` | Conductor skill + tick procedure + routing/gating policies | F0, F1 |
 | F3 | `F3-protocol-hooks.md` | SessionStart/Stop/PreCompact hooks + settings template | F0 |

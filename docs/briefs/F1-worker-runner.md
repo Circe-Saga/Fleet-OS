@@ -1,13 +1,13 @@
 # BRIEF F1: Worker runtime — spawn / run / harvest, worktrees, session ledger
 
-Class: additive      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet`      Depends: F0
+Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
 Design: `docs/agent-os-design.md` §4.2. This is the piece that retires hand-tended tabs.
 
 ## INSPECT FIRST
 
 - `docs/agent-os-design.md` §4.2 (spawn mechanics, resume semantics, cross-product rule).
-- Memory/gotcha: primary checkouts under `Circe-Saga/` sit on stale lane branches with other
+- Memory/gotcha: primary checkouts under `<workspace>/` sit on stale lane branches with other
   agents' WIP — worktrees MUST branch from `origin/main` after a `git fetch`, never from the
   primary tree's HEAD.
 - `claude -p --output-format json` result shape: `{type:"result", is_error, result,
@@ -15,7 +15,7 @@ Design: `docs/agent-os-design.md` §4.2. This is the piece that retires hand-ten
 
 ## DO NOT CHANGE
 
-- Never run a worker in a primary checkout. Worktrees live at `Circe-Saga/.worktrees/<slug>--<repo>`.
+- Never run a worker in a primary checkout. Worktrees live at `<workspace>/.worktrees/<slug>--<repo>`.
 - Do not parse worker transcripts; the ledger stores the result JSON path (`result_ref`), not prose.
 - Do not auto-retry a failed run — that's a Conductor judgment (tick), not runner behavior.
 - No daemons. `spawn`/`run` are fire-and-forget subprocesses; `harvest` collects.

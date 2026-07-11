@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""fleet.py v2 — the Saga Agent OS coordination substrate + worker runtime (workspace-scoped).
+"""fleet.py v2 — the Agent OS coordination substrate + worker runtime (workspace-scoped).
 
-Lineage: ported from Saga-EvalLab/evals/scripts/fleet.py (v1, proven in the eval-lab fleet) and
-extended per docs/agent-os-design.md. v1 solved STATE (addressed messages, focused-but-complete
+Lineage: ported from a v1 fleet.py (proven in an eval-lab fleet) and extended per
+docs/DESIGN.md. v1 solved STATE (addressed messages, focused-but-complete
 briefs, checkpoints, decisions). v2 adds the DRIVER: a task graph, a session ledger, headless
 worker spawn/resume/harvest, evidence-verified gates, and the founder queue.
 
@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 FLEET_HOME = Path(__file__).resolve().parent
-WORKSPACE = Path(os.environ.get("FLEET_WORKSPACE", str(FLEET_HOME.parent)))  # …/Circe-Saga
+WORKSPACE = Path(os.environ.get("FLEET_WORKSPACE", str(FLEET_HOME.parent)))  # …/<workspace>
 DB_PATH = Path(os.environ.get("FLEET_DB", str(FLEET_HOME / "fleet.db")))
 RUNS_DIR = Path(os.environ.get("FLEET_RUNS_DIR", str(FLEET_HOME / "runs")))
 WORKTREES = Path(os.environ.get("FLEET_WORKTREES", str(WORKSPACE / ".worktrees")))
@@ -82,9 +82,9 @@ def _resolve_model(name: str | None) -> str | None:
     return MODELS.get(name, {}).get("id", name)
 
 
-# Prod-facing repos: tier-1 review triggers (see `review-policy`).
-PROD_REPOS = ("Saga-FastAPI", "Saga-AIEditor", "Saga-MediaProcessing", "Saga-CDK",
-              "Saga-React-WebApp", "Saga-Core")
+# Prod-facing repos: tier-1 review triggers (see `review-policy`). Configure for your fleet with
+# FLEET_PROD_REPOS="repo-a,repo-b"; empty (the default) means no repo is treated as prod-facing.
+PROD_REPOS = tuple(r.strip() for r in os.environ.get("FLEET_PROD_REPOS", "").split(",") if r.strip())
 SENSITIVE_PATH_HINTS = ("auth", "consent", "privacy", "schema", "contract", "migration",
                         "security", "token", "cred")
 
@@ -1682,7 +1682,7 @@ def cmd_kestral_pending(con, a) -> int:
         "generated_ts": now_iso(),
         "agents": agents, "open_tasks": tasks, "open_decisions": decisions,
         "mapping": {
-            "project": "one Kestral Project for the fleet; source:'saga-fleet' on every object",
+            "project": "one Kestral Project for the fleet; source:'fleet-os' on every object",
             "task_status": "Kestral has 3 statuses only: QUEUED/IN_PROGRESS/IN_REVIEW → "
                            "in_progress, DONE/PARKED → done, BLOCKED/NEEDS_HUMAN → in_progress "
                            "+ tag 'blocked'/'needs-user' (probed limit, v1 design §10)",

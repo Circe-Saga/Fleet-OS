@@ -1,4 +1,4 @@
-"""Saga-Fleet test suite — drives the real CLI as subprocesses against a tmp DB.
+"""Fleet-OS test suite — drives the real CLI as subprocesses against a tmp DB.
 
 Covers the acceptance criteria in briefs F0–F5 (schema idempotency + v1 upgrade, gated task
 transitions, supersedes, decision expiry, digest, concurrency, spawn/harvest with a fake
@@ -40,6 +40,7 @@ class FleetCase(unittest.TestCase):
             "FLEET_RUNS_DIR": str(self.runs),
             "FLEET_WORKTREES": str(self.workspace / ".worktrees"),
             "FLEET_WAITING_OUT": str(self.waiting),
+            "FLEET_PROD_REPOS": "acme-api,acme-editor",
             "FLEET_LAUNCHER_CLAUDE": f"{PY} {HERE / 'fake_claude.py'}",
         }
 
@@ -171,15 +172,15 @@ class TestTaskGates(FleetCase):
         self.assertIn("unmet dependencies", r.stderr)
 
     def test_territory_overlap_refused(self):
-        t1 = self.add_task(objective="a", repo="Saga-FastAPI", territory="app/services/")
-        t2 = self.add_task(objective="b", repo="Saga-FastAPI",
+        t1 = self.add_task(objective="a", repo="acme-api", territory="app/services/")
+        t2 = self.add_task(objective="b", repo="acme-api",
                            territory="app/services/billing_store.py")
         self.fleet("task", "set-state", "--id", str(t1), "--state", "IN_PROGRESS",
                    "--actor", "conductor")
         r = self.fleet("task", "set-state", "--id", str(t2), "--state", "IN_PROGRESS",
                        "--actor", "conductor", expect=2)
         self.assertIn("territory overlaps", r.stderr)
-        t3 = self.add_task(objective="c", repo="Saga-FastAPI", territory="migrations/")
+        t3 = self.add_task(objective="c", repo="acme-api", territory="migrations/")
         self.fleet("task", "set-state", "--id", str(t3), "--state", "IN_PROGRESS",
                    "--actor", "conductor")  # disjoint territory in same repo is fine
 
@@ -259,7 +260,7 @@ class TestDecisions(FleetCase):
 
 
 class TestRunner(FleetCase):
-    def scratch_repo(self, name="Saga-Scratch"):
+    def scratch_repo(self, name="acme-scratch"):
         repo = self.workspace / name
         repo.mkdir()
         for cmd in (["git", "init", "-b", "main"],
@@ -592,8 +593,8 @@ class TestVerifyWorktreeGuard(FleetCase):
 
 class TestReviewPolicy(FleetCase):
     def test_triggers(self):
-        t_prod = self.add_task(repo="Saga-FastAPI")
-        t_lab = self.add_task(repo="Saga-EvalLab", territory="evals/scratch/")
+        t_prod = self.add_task(repo="acme-api")
+        t_lab = self.add_task(repo="acme-evallab", territory="evals/scratch/")
         d = json.loads(self.fleet("review-policy", "--task", str(t_prod)).stdout)
         self.assertTrue(d["tier1_required"])
         d = json.loads(self.fleet("review-policy", "--task", str(t_lab)).stdout)
