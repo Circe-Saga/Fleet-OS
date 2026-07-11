@@ -1,6 +1,6 @@
 # BRIEF F5: Review gates — auto review tasks + evidence verification
 
-Class: additive      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet`      Depends: F0–F2
+Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0–F2
 
 Design: `docs/agent-os-design.md` §4.4 (tiers), §5 (transition table).
 

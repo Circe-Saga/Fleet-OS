@@ -22,17 +22,18 @@ headless sessions**, so your existing CLI auth (subscription or key) is the only
    python3 fleet.py tick && python3 fleet.py status
    ```
 4. **Read `conductor/PLAYBOOK.md`** and run its tick procedure yourself (or hand it to a
-   Claude session acting as your Conductor — that is how Saga runs it).
+   Claude session acting as your Conductor — that is how it is meant to be run).
 
 ## What to replace with your own
 
-| Saga-specific piece | What it is | What you do |
+| Piece | What it is | What you do |
 |---|---|---|
-| Leadership role prompts | Saga's 16-seat cabinet lives in a *separate* docs repo; agents reference it via `--role-prompt "path#heading"` specs | Write your own role docs anywhere in your workspace; point `--role-prompt` at them. The mechanism (section extraction, system-prompt injection on every spawn/resume) is generic. |
-| `conductor/PLAYBOOK.md` §leadership, §Kestral | Saga's org conventions and its one-way project-tracker mirror | Keep the tick procedure and gates; rewrite the org sections. If you don't run a tracker mirror, ignore `kestral-*` commands — nothing else depends on them. |
+| Leadership role prompts | A role-prompt spec points at a heading in any markdown file: `--role-prompt "path#heading"` | Write your own role docs anywhere in your workspace; point `--role-prompt` at them. The mechanism (section extraction, system-prompt injection on every spawn/resume) is generic. One cabinet file can serve many roles unsplit. |
+| `conductor/PLAYBOOK.md` §leadership, §Kestral | Org conventions and a one-way project-tracker mirror | Keep the tick procedure and gates; rewrite the org sections to match your team. If you don't run a tracker mirror, ignore `kestral-*` commands — nothing else depends on them. |
+| `PROD_REPOS` / `FLEET_PROD_REPOS` | Repos whose changes trigger tier-1 review | Set `FLEET_PROD_REPOS` to a comma-separated list of your prod-facing repos. Empty (the default) means no repo is treated as prod-facing. |
 | `profiles/<alias>.md` | Curated per-model gotchas injected into worker starters | Keep the files, replace the content with what *you* learn about each model. Empty profiles are fine (fail-soft). |
 | `MODELS` registry in `fleet.py` | Alias → model-id map | One line per new model. Unknown aliases pass through untouched, so you can use raw model ids immediately. |
-| Budget policy | Saga runs on subscription auth: budgets unset, `cost_usd` treated as telemetry | If you run on API-key billing, set `--budget` on tasks — over-budget stops resumption and escalates (see PLAYBOOK standing rules). |
+| Budget policy | The reference fleet runs on subscription auth: budgets unset, `cost_usd` treated as telemetry | If you run on API-key billing, set `--budget` on tasks — over-budget stops resumption and escalates (see PLAYBOOK standing rules). |
 
 ## The parts worth stealing even if you keep nothing else
 
@@ -54,5 +55,5 @@ headless sessions**, so your existing CLI auth (subscription or key) is the only
 ## Design rationale
 
 `docs/DESIGN.md` is the full design doc (thesis: agent coordination fails on the *driver*, not
-the state layer). `docs/briefs/F0–F5` are the implementation briefs it was built from, in
-Saga's house brief format — useful as worked examples of task-shaped agent briefs.
+the state layer). `docs/briefs/F0–F5` are the implementation briefs it was built from, in the
+house brief format — useful as worked examples of task-shaped agent briefs.

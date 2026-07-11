@@ -1,6 +1,6 @@
 # BRIEF F3: Protocol hooks — enforced-or-absent
 
-Class: additive      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet`      Depends: F0
+Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
 Design: `docs/agent-os-design.md` C1 + §4.6. Any rule living only as README prose decays; these
 hooks make brief-reading and checkpointing physics instead of habits.
@@ -12,7 +12,7 @@ hooks make brief-reading and checkpointing physics instead of habits.
   (so `FLEET_SLUG`, `FLEET_DB` set by `fleet spawn` are visible).
   - SessionStart: stdout is injected as context.
   - Stop: JSON stdout `{"decision":"block","reason":"…"}` forces the agent to continue.
-- `Saga-EvalLab/docs/workstreams/README.md` rules 1+2 and the checkpoint habit — exactly what
+- `acme-evallab/docs/workstreams/README.md` rules 1+2 and the checkpoint habit — exactly what
   gets mechanized here.
 
 ## DO NOT CHANGE

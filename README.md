@@ -1,16 +1,16 @@
-# Saga-Fleet — the Agent OS substrate + worker runtime
+# Fleet-OS — the Agent OS substrate + worker runtime
 
-Workspace-scoped coordination for the Saga agent fleet. Design:
+Workspace-scoped coordination for a fleet of coding agents. Design:
 [`docs/DESIGN.md`](docs/DESIGN.md) · implementation briefs:
 [`docs/briefs/`](docs/briefs/) · Conductor procedure:
 [`conductor/PLAYBOOK.md`](conductor/PLAYBOOK.md) · adopting this for your own
 fleet: [`ADOPTING.md`](ADOPTING.md).
 
-**Thesis:** the v1 EvalLab fleet proved the state layer (addressed messages,
+**Thesis:** a v1 of this fleet proved the state layer (addressed messages,
 focused-but-complete briefs, checkpoints). What was missing is the **driver** — nothing wakes
 an idle agent. v2 adds: a task graph with evidence-verified gates, headless resumable workers
 in isolated worktrees, a session/cost ledger, protocol-enforcing hooks, and a self-draining
-founder queue.
+human queue.
 
 ## Layout
 
@@ -29,8 +29,8 @@ tests/                    # unittest suite (fake launcher; scratch git repos; tm
 ## Quickstart (founder / Conductor)
 
 ```bash
-cd Saga-Fleet
-python3 fleet.py task add --objective "…" --kind implement --repo Saga-FastAPI \
+cd Fleet-OS
+python3 fleet.py task add --objective "…" --kind implement --repo acme-api \
     --done "<falsifiable criteria>" --budget 10 --context "path/to/spec.md :: the contract"
 python3 fleet.py task set-state --id 1 --state IN_PROGRESS --actor conductor
 python3 fleet.py spawn --task 1 --model sonnet --dry-run    # inspect, then drop --dry-run
@@ -51,18 +51,18 @@ or `spawn` (paths relative to the workspace; `#heading` extracts one section of 
 so one cabinet file serves nine roles unsplit). The role text rides the worker's system prompt
 on every spawn AND resume, so identity survives compaction; the task brief stays the user
 prompt. Leadership conventions (doc-task gates, weekly memo cadence, self-filed tasks):
-`conductor/PLAYBOOK.md` §"Role-class agents". The Saga leadership cabinet is pre-seeded —
+`conductor/PLAYBOOK.md` §"Role-class agents". Seed your own cabinet and
 `python3 fleet.py status` lists the `leadership`-layer agents; address them all at once with
 `fleet msg --to leadership`.
 
-## Agent runtime vs product inference (where Bedrock does and doesn't appear)
+## Agent runtime vs product inference (where a model API does and doesn't appear)
 
 The fleet runs agents **exclusively through Claude Code** (`claude -p --resume`, headless) or
 the Codex CLI — your existing CLI auth, session resume, hooks, and permission modes for free.
-**No direct model API calls, no boto3, no Bedrock credentials anywhere in this repo or its
+**No direct model API calls, no boto3, no provider credentials anywhere in this repo or its
 tests** (grep-verifiable). The Bedrock mentions in `profiles/*.md` are knowledge FOR agents
-who write code against Saga's *product* pipeline, which calls Bedrock in prod/EvalLab — that's
-product inference, a separate layer with its own (F10) platform strategy, not how agents run.
+who write code against a *product* pipeline that happens to call a model API — that's product
+inference, a separate layer with its own platform strategy, not how agents run.
 
 ## Models
 
@@ -95,9 +95,9 @@ worker edits code, claims evidence, checkpoints → harvest (cost/session) → v
 review policy → review blocks DONE → clears → decision auto-proceed → tick → founder queue →
 retire → events audit. 25 checks; exit 0 = pass.
 
-## Migration from the EvalLab fleet (v1)
+## Migration from a v1 fleet
 
 The schema upgrades a v1 `fleet.db` in place on first connect (idempotent column adds).
-To adopt: copy EvalLab's DB here (SQLite `.backup`, never raw `cp` of a live WAL db), or point
-`FLEET_DB` at it. EvalLab's `evals/scripts/fleet.py` keeps working against its own DB until
-cutover; both understand the same core tables.
+To adopt: copy the old DB here (SQLite `.backup`, never raw `cp` of a live WAL db), or point
+`FLEET_DB` at it. A v1 `fleet.py` keeps working against its own DB until cutover; both
+understand the same core tables.

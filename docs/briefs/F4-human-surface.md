@@ -1,6 +1,6 @@
 # BRIEF F4: Human surface — WAITING_ON_YOU.md + self-draining decisions
 
-Class: additive      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet`      Depends: F0
+Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
 Design: `docs/agent-os-design.md` §4.5, §7 (escalation), §12 (founder experience).
 
@@ -20,7 +20,7 @@ Design: `docs/agent-os-design.md` §4.5, §7 (escalation), §12 (founder experie
 
 ## DELIVERABLES
 
-1. `fleet render-waiting [--out PATH]` — writes `Circe-Saga/WAITING_ON_YOU.md`:
+1. `fleet render-waiting [--out PATH]` — writes `<workspace>/WAITING_ON_YOU.md`:
    - Open decisions, grouped by category (`authorization` first), each one screen: question,
      detail, raiser + task link, **default recommendation**, expiry + what-happens-if-nothing,
      respond hint (`fleet resolve --id N --resolution "…"` / "tell the Conductor").

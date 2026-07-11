@@ -1,17 +1,17 @@
-# BRIEF F0: Saga-Fleet repo, schema v2, task/digest/starter CLI
+# BRIEF F0: Fleet-OS repo, schema v2, task/digest/starter CLI
 
-Class: new-repo-foundation      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet` (create)
+Class: new-repo-foundation      Repo: `<workspace>/Fleet-OS` (create)
 
-Design: `/Users/jackychen/Workspace/Circe-Saga/docs/agent-os-design.md` §4.1, §5, §10.
+Design: `<workspace>/docs/agent-os-design.md` §4.1, §5, §10.
 
 ## INSPECT FIRST
 
-- `/Users/jackychen/Workspace/Circe-Saga/Saga-EvalLab/evals/scripts/fleet.py`
+- `<workspace>/acme-evallab/evals/scripts/fleet.py`
   - The v1 substrate being ported. Keep verbatim where proven: `connect`/`write_txn` (WAL +
     BEGIN IMMEDIATE, fleet.py:150-171), `addressed_to` (174), `cmd_brief`/`_brief_data`
     (339-434, incl. the ✅ ANSWERED show-once delivery), `cmd_checkpoint` (209), `cmd_resolve`
     un-stick logic (287-321), `cmd_inspect` cursor-preserving read (441).
-- `/Users/jackychen/Workspace/Circe-Saga/Saga-EvalLab/docs/FLEET_COORDINATION_DESIGN.md`
+- `<workspace>/acme-evallab/docs/FLEET_COORDINATION_DESIGN.md`
   - §3 writers-address-correctly; §7 concurrency model. Both principles carry over unchanged.
 
 ## DO NOT CHANGE
@@ -20,7 +20,7 @@ Design: `/Users/jackychen/Workspace/Circe-Saga/docs/agent-os-design.md` §4.1, �
   `ack`, `status`, `log`, `inspect`) — EvalLab agents may cut over with muscle memory intact.
 - Do not store anything observable from git/GitHub (no PR-state, CI-state, merged columns).
 - Do not put prose in the DB — envelopes, queues, cursors, ledgers only.
-- Do not touch `Saga-EvalLab`'s fleet.py or fleet.db; the workspace fleet is a parallel install.
+- Do not touch `acme-evallab`'s fleet.py or fleet.db; the workspace fleet is a parallel install.
 
 ## SCHEMA DELTAS
 
@@ -28,7 +28,7 @@ Exactly the DDL in design §4.1: new tables `tasks`, `runs`, `events`; new colum
 `workstreams` (product, model, repo, worktree, session_id, lifetime), `messages` (kind,
 requires_action, supersedes_id, verified, routed_ts), `decisions` (default_recommendation,
 reversible, expires_ts, auto_resolved, category). All column adds idempotent (guard with
-`PRAGMA table_info`). DB path: `$FLEET_DB` env else `<Saga-Fleet>/fleet.db`.
+`PRAGMA table_info`). DB path: `$FLEET_DB` env else `<Fleet-OS>/fleet.db`.
 
 ## COMMANDS (new)
 
@@ -60,7 +60,7 @@ section; concurrent `msg` writes from two connections both land.
 ## GOLDEN PATH
 
 ```
-fleet task add --objective "port decode-race fix" --kind implement --repo Saga-AIEditor \
+fleet task add --objective "port decode-race fix" --kind implement --repo acme-editor \
   --done "atomic temp+rename in prod decode path; regression test green" --budget 8
 fleet task set-state --id 1 --state IN_PROGRESS --actor conductor
 fleet task evidence --id 1 --test-cmd "pytest tests/test_decode_race.py"

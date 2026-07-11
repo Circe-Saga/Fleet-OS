@@ -1,6 +1,6 @@
 # BRIEF F2: Conductor playbook + tick
 
-Class: doc+cli      Repo: `/Users/jackychen/Workspace/Circe-Saga/Saga-Fleet`      Depends: F0, F1
+Class: doc+cli      Repo: `<workspace>/Fleet-OS`      Depends: F0, F1
 
 Design: `docs/agent-os-design.md` §3 (authority model), §4.3 (tick), §6 (spawn policy), §8.
 
@@ -9,7 +9,7 @@ Design: `docs/agent-os-design.md` §3 (authority model), §4.3 (tick), §6 (spaw
 - Design §4.3 — the 7-step tick. Steps 1 (gather), 2-mechanical (stale/cycle/expiry), 6-partial
   (render queue) are deterministic → `fleet tick`. Steps 2-judgment, 3 (route), 4 (drive),
   5 (gate) are LLM judgment → the playbook.
-- `Saga-EvalLab/docs/workstreams/README.md` "review loop" — the human↔coordinator↔agent loop
+- `acme-evallab/docs/workstreams/README.md` "review loop" — the human↔coordinator↔agent loop
   v2 automates; the Conductor inherits the coordinator role with `inspect` (cursor-preserving).
 
 ## DO NOT CHANGE
