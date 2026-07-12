@@ -50,3 +50,27 @@ What you deliver instead:
 Budget your turns for CODE and headless checks. Do not spend turns trying to boot or drive a
 resource you are not allowed to — you will run out of turns before the work is delivered. Deliver
 code + headless-green + the manual-check note, then STOP.
+
+### Exception: leasing a shared device (e.g. a simulator/emulator)
+
+The rule above is **deny-by-default: the Conductor owns visual/manual QA on shared devices.** The
+only exception is when YOUR task's brief explicitly grants sim/emulator access — a context ref or
+the objective/done-criteria says so in plain terms. If it doesn't say so, you are not granted it;
+follow the rule above (manual-check note, skip the device) and don't ask "can I use it" — that's a
+brief-quality question for whoever wrote it, not something to negotiate mid-run.
+
+When a brief DOES grant it, the fleet has exactly ONE persistent instance of the shared device —
+booting a second one (a second simulator, a second emulator) slows the whole host machine for
+every lane sharing it, including yours. Protocol, in order:
+
+1. **Acquire before you touch it.** Before any `xcrun simctl`, `expo run:ios`, or other
+   boot/launch of the device: `python3 fleet.py lease acquire --resource <name> --as <slug>`
+   (e.g. `--resource ios-sim`). A refusal means someone else holds it — do not boot a second
+   instance to work around a busy one; wait, or `fleet msg` them to ask when they'll release it.
+2. **Use only the device the lease names.** `lease acquire` refuses a `--device` that doesn't
+   match the fleet's pinned device for that resource (`FLEET_LEASE_DEVICES`); omit `--device` and
+   it resolves to the pin automatically. Never boot a second device under any name.
+3. **Release the moment you're done — success or failure.** `python3 fleet.py lease release
+   --resource <name> --as <slug>`, as part of your finish protocol, before you report. A crashed
+   or turn-capped run's lease is auto-reaped by the next `fleet tick` (dead holder run → released),
+   but that is a safety net, not a substitute for releasing explicitly.

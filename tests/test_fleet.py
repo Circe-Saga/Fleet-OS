@@ -627,5 +627,92 @@ class TestReviewPolicy(FleetCase):
         self.assertTrue(d["tier1_required"])
 
 
+class TestLeases(FleetCase):
+    def _insert_run(self, slug, pid, status="running"):
+        self.fleet("status")   # ensure the schema (incl. runs) exists before the raw INSERT
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
+                    "VALUES (?,'claude',?,?,'2026-01-01')", (slug, status, pid))
+        con.commit(); con.close()
+
+    def test_acquire_then_status_shows_holder(self):
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        out = self.fleet("lease", "status", "--resource", "ios-sim").stdout
+        self.assertIn("held by lane-a", out)
+
+    def test_acquire_refused_while_live_holder_holds(self):
+        self._insert_run("lane-a", os.getpid())   # this test process: a genuinely live pid
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b", expect=2)
+        self.assertIn("held by lane-a", r.stderr)
+        self.assertIn("Conductor owns visual QA", r.stderr)
+        self.assertEqual(self.q("SELECT holder_slug FROM leases WHERE released_ts IS NULL")[0]
+                         ["holder_slug"], "lane-a")
+
+    def test_acquire_reaps_stale_holder_whose_run_is_dead(self):
+        self._insert_run("lane-a", 999999999)   # dead pid → holder's run is not alive
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b")
+        self.assertIn("reaped stale lease", r.stderr)
+        rows = self.q("SELECT holder_slug, released_ts FROM leases ORDER BY id")
+        self.assertIsNotNone(rows[0]["released_ts"])
+        self.assertEqual(rows[1]["holder_slug"], "lane-b")
+
+    def test_refresh_is_idempotent_for_the_same_holder(self):
+        self._insert_run("lane-a", os.getpid())
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        self.assertIn("refreshed", r.stdout)
+        self.assertEqual(len(self.q("SELECT id FROM leases")), 1)
+
+    def test_release_by_non_holder_refused(self):
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        r = self.fleet("lease", "release", "--resource", "ios-sim", "--as", "lane-b", expect=2)
+        self.assertIn("held by lane-a", r.stderr)
+
+    def test_release_frees_the_resource(self):
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        self.fleet("lease", "release", "--resource", "ios-sim", "--as", "lane-a")
+        out = self.fleet("lease", "status", "--resource", "ios-sim").stdout
+        self.assertIn("free", out)
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b")  # now unblocked
+
+    def test_device_pin_refuses_mismatch_and_allows_match(self):
+        env = {"FLEET_LEASE_DEVICES": "ios-sim=iPhone17-t111"}
+        r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
+                       "--device", "some-other-device", expect=2, env_extra=env)
+        self.assertIn("pinned to device", r.stderr)
+        self.assertEqual(self.q("SELECT id FROM leases"), [])
+        r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
+                       "--device", "iPhone17-t111", env_extra=env)
+        self.assertIn("iPhone17-t111", r.stdout)
+        # omitting --device falls back to the pin, not an unconstrained lease
+        self.fleet("lease", "release", "--resource", "ios-sim", "--as", "lane-a", env_extra=env)
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b", env_extra=env)
+        self.assertEqual(self.q("SELECT device FROM leases ORDER BY id DESC LIMIT 1")[0]
+                         ["device"], "iPhone17-t111")
+
+    def test_tick_reaps_stale_lease(self):
+        self._insert_run("lane-a", 999999999)
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        out = self.fleet("tick").stdout
+        self.assertIn("reaped ios-sim", out)
+        self.assertIsNotNone(self.q("SELECT released_ts FROM leases")[0]["released_ts"])
+        out2 = self.fleet("lease", "status", "--resource", "ios-sim").stdout
+        self.assertIn("free", out2)
+
+    def test_status_json(self):
+        self._insert_run("lane-a", os.getpid())
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        d = json.loads(self.fleet("lease", "status", "--resource", "ios-sim", "--json").stdout)
+        self.assertEqual(d, [{"resource": "ios-sim", "held": True, "holder": "lane-a",
+                              "device": None, "acquired_ts": d[0]["acquired_ts"],
+                              "stale": False}])
+
+    def test_status_with_no_leases_ever(self):
+        out = self.fleet("lease", "status").stdout
+        self.assertIn("no leases ever recorded", out)
+
+
 if __name__ == "__main__":
     unittest.main()

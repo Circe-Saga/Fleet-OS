@@ -18,6 +18,7 @@ Worker surface (unchanged from v1 + evidence claims):
     fleet checkpoint --as <slug> --did … --next … [--review … --ask]
     fleet msg --from <slug> --to <addr> --kind handoff --requires-action --body …
     fleet task evidence --id N --test-cmd "pytest …" --pr "#12"
+    fleet lease acquire/release --resource ios-sim --as <slug>   # deny-by-default; brief-granted only
 
 Conductor surface:
     fleet tick                          # mechanical half of the tick; prints the judgment queue
@@ -87,6 +88,18 @@ def _resolve_model(name: str | None) -> str | None:
 PROD_REPOS = tuple(r.strip() for r in os.environ.get("FLEET_PROD_REPOS", "").split(",") if r.strip())
 SENSITIVE_PATH_HINTS = ("auth", "consent", "privacy", "schema", "contract", "migration",
                         "security", "token", "cred")
+
+# Device pinning for shared-resource leases (see `lease`): resource -> the ONE device name a
+# holder may use. A second booted device (simulator/emulator) slows the whole host for every
+# lane sharing it, so `lease acquire` refuses a --device that doesn't match the pin. Configure
+# with FLEET_LEASE_DEVICES="ios-sim=iPhone17-t111,android-emu=Pixel8"; a resource absent from
+# this map has no device constraint (device name is free text, or omitted entirely).
+LEASE_DEVICES = dict(
+    kv.split("=", 1) for kv in os.environ.get("FLEET_LEASE_DEVICES", "").split(",") if "=" in kv)
+# Backstop expiry for a lease whose holder never explicitly released it and whose run row is,
+# for whatever reason, unreadable as dead (see _holder_run_alive) — a belt to the tick reaper's
+# suspenders. Configure with FLEET_LEASE_TTL_SECONDS; default 30 minutes.
+LEASE_DEFAULT_TTL = int(os.environ.get("FLEET_LEASE_TTL_SECONDS", "1800"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS workstreams (
@@ -181,11 +194,24 @@ CREATE TABLE IF NOT EXISTS events (
   detail  TEXT,
   ts      TEXT NOT NULL
 );
+-- v2: exclusive shared-resource mutex (e.g. one iOS simulator many lanes must take turns on).
+-- One row per acquisition (not one row per resource) so the history stays an audit trail;
+-- "the" lease on a resource is its newest row with released_ts IS NULL.
+CREATE TABLE IF NOT EXISTS leases (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  resource     TEXT NOT NULL,
+  holder_slug  TEXT NOT NULL,
+  device       TEXT,
+  acquired_ts  TEXT NOT NULL,
+  ttl_seconds  INTEGER NOT NULL,
+  released_ts  TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_addr, ts);
 CREATE INDEX IF NOT EXISTS idx_messages_tier ON messages(tier, resolved_ts);
 CREATE INDEX IF NOT EXISTS idx_updates_slug ON updates(slug, ts);
 CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource, released_ts);
 """
 
 # Idempotent column adds so an existing v1 fleet.db upgrades in place on first connect.
@@ -1199,6 +1225,12 @@ def _render_starter(con, t, agent_row) -> str:
         "",
         "Protocol (hook-enforced; listed so you know):",
         f"  - checkpoint before every stop: fleet checkpoint --as {slug} --did … --next …",
+        "  - shared devices (simulator/emulator) are DENY-BY-DEFAULT — the Conductor owns "
+        "visual QA. Only touch one if THIS brief explicitly grants it; if it does: `fleet "
+        f"lease acquire --resource <name> --as {slug}` before any boot/use, the ONE pinned "
+        f"device only (never a second — it slows the whole machine), `fleet lease release "
+        f"--resource <name> --as {slug}` the moment you're done (see "
+        "conductor/worker-rules.md).",
         f"  - blockers: fleet msg --from {slug} --to <who-can-clear-it> --tier BLOCKER "
         "--kind request --requires-action --body …",
         f"  - claim completion evidence: fleet task evidence --id {t['id']} --test-cmd \"…\" "
@@ -1486,6 +1518,129 @@ def cmd_retire(con, a) -> int:
     return 0
 
 
+# ── shared-resource leases (one physical/simulated device many lanes must take turns on) ────
+def _active_lease(con, resource: str):
+    return con.execute(
+        "SELECT * FROM leases WHERE resource=? AND released_ts IS NULL ORDER BY id DESC LIMIT 1",
+        (resource,)).fetchone()
+
+
+def _holder_run_alive(con, slug: str) -> bool:
+    row = con.execute(
+        "SELECT pid FROM runs WHERE agent_slug=? AND status='running' ORDER BY id DESC LIMIT 1",
+        (slug,)).fetchone()
+    return bool(row and _pid_alive(row["pid"]))
+
+
+def _lease_is_stale(con, row) -> bool:
+    """A lease outlived the work it was guarding if its TTL lapsed OR its holder's headless
+    run no longer has a live pid — the two ways it can go stale without an explicit release."""
+    acquired = _parse(row["acquired_ts"])
+    ttl_expired = bool(acquired and
+                       (datetime.now(timezone.utc) - acquired) > timedelta(seconds=row["ttl_seconds"]))
+    return ttl_expired or not _holder_run_alive(con, row["holder_slug"])
+
+
+def cmd_lease_acquire(con, a) -> int:
+    pinned = LEASE_DEVICES.get(a.resource)
+    if pinned and a.device and a.device != pinned:
+        print(f"REFUSED: {a.resource} is pinned to device '{pinned}' — booting a second device "
+              f"slows the whole machine for every lane sharing it. Drop --device or pass "
+              f"--device {pinned}.", file=sys.stderr)
+        return 2
+    device = a.device or pinned
+    with write_txn(con):
+        cur = _active_lease(con, a.resource)
+        if cur and cur["holder_slug"] == a.slug:
+            con.execute("UPDATE leases SET acquired_ts=?, ttl_seconds=? WHERE id=?",
+                        (now_iso(), a.ttl or cur["ttl_seconds"], cur["id"]))
+            _event(con, a.slug, "lease-refresh", a.resource, device)
+            print(f"✓ refreshed lease #{cur['id']} on {a.resource} for {a.slug}"
+                  + (f" (device {device})" if device else ""))
+            return 0
+        if cur and not _lease_is_stale(con, cur):
+            print(f"REFUSED: {a.resource} is held by {cur['holder_slug']} (lease #{cur['id']}, "
+                  f"acquired {ago(cur['acquired_ts'])}). The Conductor owns visual QA by "
+                  f"default — only lease when YOUR brief explicitly grants it; if it does, wait "
+                  f"for {cur['holder_slug']} to release, or ask them via `fleet msg`.",
+                  file=sys.stderr)
+            return 2
+        if cur:
+            con.execute("UPDATE leases SET released_ts=? WHERE id=?", (now_iso(), cur["id"]))
+            _event(con, "conductor", "lease-reap", a.resource,
+                   f"stale holder {cur['holder_slug']} (lease #{cur['id']}) reaped before "
+                   f"{a.slug} acquired")
+            print(f"  ↻ reaped stale lease #{cur['id']} ({cur['holder_slug']}) first",
+                  file=sys.stderr)
+        ttl = a.ttl or LEASE_DEFAULT_TTL
+        con.execute("""INSERT INTO leases (resource,holder_slug,device,acquired_ts,ttl_seconds)
+                       VALUES (?,?,?,?,?)""", (a.resource, a.slug, device, now_iso(), ttl))
+        lid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        _event(con, a.slug, "lease-acquire", a.resource, device)
+    print(f"✓ lease #{lid}: {a.resource} → {a.slug}" + (f" (device {device})" if device else "")
+          + f", ttl {ttl}s — release the moment you're done: fleet lease release --resource "
+            f"{a.resource} --as {a.slug}")
+    return 0
+
+
+def cmd_lease_release(con, a) -> int:
+    cur = _active_lease(con, a.resource)
+    if not cur:
+        print(f"(no active lease on {a.resource})")
+        return 0
+    if cur["holder_slug"] != a.slug:
+        print(f"REFUSED: {a.resource} is held by {cur['holder_slug']}, not {a.slug}",
+              file=sys.stderr)
+        return 2
+    with write_txn(con):
+        con.execute("UPDATE leases SET released_ts=? WHERE id=?", (now_iso(), cur["id"]))
+        _event(con, a.slug, "lease-release", a.resource, None)
+    print(f"✓ released lease #{cur['id']} on {a.resource}")
+    return 0
+
+
+def cmd_lease_status(con, a) -> int:
+    resources = [a.resource] if a.resource else sorted(
+        {r["resource"] for r in con.execute("SELECT DISTINCT resource FROM leases")})
+    rows = []
+    for res in resources:
+        cur = _active_lease(con, res)
+        if not cur:
+            rows.append({"resource": res, "held": False})
+        else:
+            rows.append({"resource": res, "held": True, "holder": cur["holder_slug"],
+                        "device": cur["device"], "acquired_ts": cur["acquired_ts"],
+                        "stale": _lease_is_stale(con, cur)})
+    if a.json:
+        print(json.dumps(rows))
+        return 0
+    if not rows:
+        print("(no leases ever recorded)")
+        return 0
+    for row in rows:
+        if not row["held"]:
+            print(f"{row['resource']}: free")
+            continue
+        flag = "  ⚠ STALE (next `fleet tick` reaps it)" if row["stale"] else ""
+        print(f"{row['resource']}: held by {row['holder']}"
+              + (f" (device {row['device']})" if row["device"] else "")
+              + f", acquired {ago(row['acquired_ts'])}{flag}")
+    return 0
+
+
+def _reap_stale_leases(con) -> list[dict]:
+    reaped = []
+    for row in con.execute("SELECT * FROM leases WHERE released_ts IS NULL").fetchall():
+        if _lease_is_stale(con, row):
+            with write_txn(con):
+                con.execute("UPDATE leases SET released_ts=? WHERE id=?", (now_iso(), row["id"]))
+                _event(con, "conductor", "lease-reap", row["resource"],
+                       f"holder {row['holder_slug']} (lease #{row['id']}) — dead run or ttl "
+                       f"expired")
+            reaped.append(dict(row))
+    return reaped
+
+
 # ── digest / tick / projections ──────────────────────────────────────────────────────────────
 def _digest_data(con) -> dict:
     now = datetime.now(timezone.utc)
@@ -1760,6 +1915,13 @@ def cmd_tick(con, a) -> int:
     cmd_harvest(con, argparse.Namespace())
     print("── tick: expired reversible decisions ──")
     cmd_resolve_expired(con, argparse.Namespace())
+    print("── tick: lease reap ──")
+    reaped = _reap_stale_leases(con)
+    if reaped:
+        for r in reaped:
+            print(f"  ↻ reaped {r['resource']} (was held by {r['holder_slug']}, lease #{r['id']})")
+    else:
+        print("  clean")
     d = _digest_data(con)
     print("── tick: reconcile scan ──")
     for s in d["stale_tasks"]:
@@ -1902,6 +2064,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--actor", required=True, help="your slug, or conductor/founder")
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_task_set_state)
+
+    l = sub.add_parser(
+        "lease", help="exclusive shared-resource mutex (e.g. one simulator many lanes share)"
+    ).add_subparsers(dest="lease_cmd", required=True)
+    s = l.add_parser("acquire", help="claim the resource; refused if another live holder has it")
+    s.add_argument("--resource", required=True, help="e.g. ios-sim")
+    s.add_argument("--as", dest="slug", required=True)
+    s.add_argument("--device", help="must match FLEET_LEASE_DEVICES' pin for this resource, if set")
+    s.add_argument("--ttl", type=int,
+                   help=f"seconds until stale even with a live run (default {LEASE_DEFAULT_TTL})")
+    s.set_defaults(fn=cmd_lease_acquire)
+    s = l.add_parser("release", help="release your own lease")
+    s.add_argument("--resource", required=True)
+    s.add_argument("--as", dest="slug", required=True)
+    s.set_defaults(fn=cmd_lease_release)
+    s = l.add_parser("status", help="who holds what (omit --resource for all)")
+    s.add_argument("--resource")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_lease_status)
 
     s = sub.add_parser("verify", help="conductor gate: re-run claimed evidence in the worktree")
     s.add_argument("--task", dest="id", type=int, required=True)
