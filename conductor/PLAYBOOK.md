@@ -249,6 +249,31 @@ Conductor-side hygiene that costs gates when skipped: an agent row without a reg
 incidents on 2026-07-07 before the fleet.py fix). Until you're on a build with the fix,
 set `--worktree` at registration and check it before the first verify.
 
+## Shared-device leases (simulator/emulator)
+
+Some verification needs a device the fleet only has ONE persistent instance of (a simulator, an
+emulator) — a second instance slows the whole host for every lane sharing it. Default posture is
+**you own visual/manual QA on it; workers don't touch it** (`conductor/worker-rules.md`). The
+`fleet lease` mutex exists for the rare case a task genuinely needs a worker to drive it directly.
+
+- **Granting access**: put it in the task explicitly — a context ref or the objective/done-
+  criteria naming the device work — when you file or assign the task. Silence means deny; workers
+  are told not to ask mid-run.
+- **`fleet lease status`** (add `--resource <name>` to scope it, `--json` for the digest):  who
+  holds what, and whether the current holder looks stale. Check it before granting a NEW lease
+  task if you suspect contention.
+- **Reaping is automatic**: `fleet tick` releases any lease whose holder's headless run no longer
+  has a live pid, plus a TTL backstop (`FLEET_LEASE_TTL_SECONDS`, default 1800s) for the case a
+  holder's run row is misleading. You don't need to release on a worker's behalf — tick does it.
+- **Device pinning**: set `FLEET_LEASE_DEVICES="ios-sim=iPhone17-t111"` (comma-separated
+  `resource=device` pairs) once per fleet. `lease acquire` then refuses any `--device` that
+  doesn't match the pin, so a lane cannot boot a second device even by accident.
+- **If a holder won't release and looks alive** (not reaped, not responding): `fleet inspect
+  --slug <holder>` first — it may be legitimately mid-use. If truly stuck, `fleet lease release
+  --resource <name> --as <holder-slug>` as the Conductor is a normal escalation, not a hack (the
+  CLI only checks holder == the `--as` you pass; use the SAME slug the lease shows, don't spoof
+  another lane's identity to seize it — that would mask the real problem).
+
 ## Model strategy
 
 You own model assignment for the fleet (`fleet models` is your view: registry, per-agent
