@@ -212,6 +212,25 @@ class TestMessaging(FleetCase):
         self.assertEqual(errs, [])
         self.assertEqual(len(self.q("SELECT id FROM messages")), 6)
 
+    def test_task_addressed_msg_reaches_owner_and_blocker_persists(self):
+        # msg to 'task:N' must reach N's owner even though to_addr matches neither
+        # all/slug/layer — this is the addressing gap the owner-side task_addrs fix closes.
+        self.fleet("set", "--slug", "lane-a", "--state", "ACTIVE")
+        tid = self.add_task(owner="lane-a")
+        self.fleet("msg", "--from", "conductor", "--to", f"task:{tid}", "--tier", "BLOCKER",
+                   "--kind", "request", "--requires-action", "--body", "respawn: clear this first")
+        out = self.fleet("brief", "--as", "lane-a").stdout
+        self.assertIn("clear this first", out)
+        self.assertIn("BLOCKED on you (1)", out)
+        # BLOCKER tier is persistent: it must still surface on a second brief, unacked
+        out2 = self.fleet("brief", "--as", "lane-a").stdout
+        self.assertIn("clear this first", out2)
+        self.assertIn("BLOCKED on you (1)", out2)
+        self.fleet("ack", "--as", "lane-a", "--id", "1")
+        out3 = self.fleet("brief", "--as", "lane-a").stdout
+        self.assertNotIn("clear this first", out3)
+        self.assertIn("BLOCKED on you (0)", out3)
+
     def test_gate_request_lands_in_digest(self):
         self.fleet("msg", "--from", "lane-a", "--to", "conductor", "--kind", "request",
                    "--requires-action", "--body", "task #1 ready for IN_REVIEW")

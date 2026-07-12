@@ -618,11 +618,14 @@ def _brief_data(con, slug: str) -> dict:
 
     msgs = con.execute("SELECT * FROM messages ORDER BY ts").fetchall()
     lr = _parse(last_read)
+    # task:N addressing must reach the task's current owner — without this, messages sent to
+    # a task (the natural address when respawning a lane) are silently invisible to the agent.
+    task_addrs = {f"task:{t['id']}" for t in tasks}
     blocked_on_me, protocol, unread = [], [], []
     for m in msgs:
         if m["id"] in superseded:      # a later message retracted this claim — never surface it
             continue
-        if not addressed_to(m["to_addr"], slug, layer):
+        if not addressed_to(m["to_addr"], slug, layer) and m["to_addr"] not in task_addrs:
             continue
         if m["tier"] in PERSISTENT_TIERS:
             if m["resolved_ts"] is None and m["id"] not in acked:
