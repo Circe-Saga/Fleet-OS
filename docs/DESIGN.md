@@ -73,8 +73,13 @@ Two design commitments follow from failure analysis of v1:
 - N3. Not a message bus, daemon, or web service in v2. The Conductor tick is a command; the
   transport is a SQLite file; workers are subprocesses. Event-driven upgrades come later if
   tick latency actually hurts.
-- N4. Not multi-machine. One workstation, one DB. A local HTTP shim is a known, deferred upgrade
-  path if cloud/second-box workers arrive.
+- N4. ~~Not multi-machine. One workstation, one DB.~~ **Superseded (E-A):** with `FLEET_DB=postgres://`
+  the DB is shared across machines. No HTTP shim was needed — coordination goes through the shared
+  DB directly. Machine-scoped rows (runs, leases, an agent's worktree/session) carry a `host`;
+  harvest/reap are host-scoped; the lease mutex is a DB partial-unique index; a run's cross-host
+  liveness is a heartbeat TTL (its pid is meaningless off-box); verify/resume are host-pinned. See
+  migrations/0002_multihost.sql and the multi-host invariants in
+  Saga-Fleet/docs/FLEET-CLOUD-ARCHITECTURE.md §1.2. SQLite (one workstation) stays the default.
 
 ---
 

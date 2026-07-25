@@ -36,6 +36,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -117,6 +118,28 @@ LEASE_DEVICES = dict(
 # suspenders. Configure with FLEET_LEASE_TTL_SECONDS; default 30 minutes.
 LEASE_DEFAULT_TTL = int(os.environ.get("FLEET_LEASE_TTL_SECONDS", "1800"))
 
+# ── multi-host identity (shared Postgres; two commanders on two machines) ────────────────────
+# Under one shared DB every machine-scoped row (a run, a lease, an agent's worktree/session)
+# carries the host that owns it. FLEET_HOST overrides the OS hostname — the seam the test suite
+# uses to simulate two hosts against one DB, and the knob the cutover import uses to backfill the
+# adopted machine. FLEET_COMMANDER is the actor-identity signature on the audit log (events),
+# replacing the old "everything signs --actor conductor" ambiguity; defaults to the host.
+def _this_host() -> str:
+    return os.environ.get("FLEET_HOST") or socket.gethostname()
+
+
+def _this_commander() -> str:
+    return os.environ.get("FLEET_COMMANDER") or _this_host()
+
+
+# Cross-host liveness signal. A run's pid is meaningful ONLY on the machine that spawned it
+# (os.kill(pid,0) on another host inspects an unrelated local process), so a run owned by a
+# remote host is judged live by heartbeat freshness instead: the run's own fleet CLI calls
+# (brief/checkpoint, which the hooks fire regularly) bump heartbeat_ts. A remote run whose
+# heartbeat lapsed past this TTL is treated as dead — the only safe way host B may reap a lease
+# host A abandoned. Generous by default so a quiet-but-live remote run is not falsely reaped.
+HEARTBEAT_TTL_SECONDS = int(os.environ.get("FLEET_HEARTBEAT_TTL_SECONDS", "900"))
+
 # The full current schema lives in versioned SQL files under migrations/ (0001_initial.sql is
 # the whole thing). run_migrations() applies each file exactly once, tracked in a
 # schema_migrations table — no more executescript on every invocation.
@@ -187,6 +210,11 @@ def ago(ts: str | None) -> str:
 def is_stale(ts: str | None) -> bool:
     dt = _parse(ts)
     return bool(dt and (datetime.now(timezone.utc) - dt).days > STALE_DAYS)
+
+
+def _heartbeat_fresh(ts: str | None) -> bool:
+    dt = _parse(ts)
+    return bool(dt and (datetime.now(timezone.utc) - dt) <= timedelta(seconds=HEARTBEAT_TTL_SECONDS))
 
 
 # ── dual backend: SQLite (default) or Postgres (FLEET_DB=postgres://…) ───────────────────────
@@ -342,12 +370,32 @@ def connect():
     return con
 
 
+# A unique-constraint violation surfaces as different exception classes per backend; catch both
+# so the DB-enforced lease mutex (uq_leases_active) reads the same on SQLite and Postgres.
+_UNIQUE_VIOLATION: tuple = (sqlite3.IntegrityError,)
+if _HAVE_PSYCOPG:
+    _UNIQUE_VIOLATION = (sqlite3.IntegrityError, psycopg.errors.UniqueViolation)
+
+
 def _insert_id(con, sql: str, params):
     """INSERT a row and return its new integer primary key, portably. SQLite uses cursor.lastrowid;
     Postgres has no lastrowid, so append RETURNING id and read it back."""
     if IS_PG:
         return con.execute(sql + " RETURNING id", params).fetchone()[0]
     return con.execute(sql, params).lastrowid
+
+
+def _serialize_on(con, key: str):
+    """Serialize a CLASS of write transactions on a string key for the rest of the current
+    transaction (auto-released at commit/rollback). No-op under SQLite — BEGIN IMMEDIATE already
+    holds a global writer lock, so every write is serialized. Needed under Postgres (READ
+    COMMITTED) wherever a guard reads rows OTHER than the one it holds with FOR UPDATE: FOR UPDATE
+    locks only its own row, so two transactions touching different rows but the same shared
+    invariant (e.g. the territory-overlap scan across a repo) would both pass the guard and both
+    write — classic write-skew. A pg_advisory_xact_lock on the shared key makes them take turns;
+    the loser then re-reads under READ COMMITTED and sees the winner's committed row."""
+    if IS_PG:
+        con.execute("SELECT pg_advisory_xact_lock(hashtext(?))", (key,))
 
 
 @contextmanager
@@ -374,8 +422,11 @@ def addressed_to(to_addr: str, slug: str, layer: str | None) -> bool:
 
 
 def _event(con, actor: str, action: str, subject: str | None = None, detail: str | None = None):
-    con.execute("INSERT INTO events (actor,action,subject,detail,ts) VALUES (?,?,?,?,?)",
-                (actor, action, subject, detail, now_iso()))
+    # `actor` is the ROLE (worker slug / conductor / founder); `commander` is the MACHINE+human
+    # identity that ran it. Signing both means the shared audit log can tell two commanders apart
+    # even when both act as "conductor" (the old ambiguity — see architecture §1.2 item 1).
+    con.execute("INSERT INTO events (actor,commander,action,subject,detail,ts) VALUES (?,?,?,?,?,?)",
+                (actor, _this_commander(), action, subject, detail, now_iso()))
 
 
 def _j(row) -> dict:
@@ -446,7 +497,7 @@ def cmd_set(con, a) -> int:
         "slug": a.slug, "owner": None, "layer": None, "state": "ACTIVE", "status_line": None,
         "next": None, "blockers": None, "branch": None, "kestral_id": None, "product": "claude",
         "model": None, "repo": None, "worktree": None, "session_id": None,
-        "lifetime": "territory", "role_prompt": None}
+        "lifetime": "territory", "role_prompt": None, "host": None}
     for field, val in (("owner", a.owner), ("layer", a.layer), ("state", a.state),
                        ("status_line", a.status), ("next", a.next), ("blockers", a.blockers),
                        ("branch", a.branch), ("product", a.product), ("model", a.model),
@@ -454,22 +505,28 @@ def cmd_set(con, a) -> int:
                        ("lifetime", a.lifetime), ("role_prompt", a.role_prompt)):
         if val is not None:
             cur[field] = val
+    # Registering a worktree (or session) binds this agent to THIS host — the path/transcript are
+    # local. Verify and resume-pinning read this to refuse politely on the wrong machine.
+    if a.worktree is not None or a.session_id is not None:
+        cur["host"] = _this_host()
+    cur.setdefault("host", None)
     if cur["state"] not in AGENT_STATES:
         print(f"ERROR: --state must be one of {AGENT_STATES}", file=sys.stderr)
         return 2
     with write_txn(con):
         con.execute(
             """INSERT INTO workstreams (slug,owner,layer,state,status_line,next,blockers,branch,
-                 kestral_id,product,model,repo,worktree,session_id,lifetime,role_prompt,updated_ts)
+                 kestral_id,product,model,repo,worktree,session_id,lifetime,role_prompt,host,
+                 updated_ts)
                VALUES (:slug,:owner,:layer,:state,:status_line,:next,:blockers,:branch,
                  :kestral_id,:product,:model,:repo,:worktree,:session_id,:lifetime,:role_prompt,
-                 :updated_ts)
+                 :host,:updated_ts)
                ON CONFLICT(slug) DO UPDATE SET
                  owner=excluded.owner, layer=excluded.layer, state=excluded.state,
                  status_line=excluded.status_line, next=excluded.next, blockers=excluded.blockers,
                  branch=excluded.branch, product=excluded.product, model=excluded.model,
                  repo=excluded.repo, worktree=excluded.worktree, session_id=excluded.session_id,
-                 lifetime=excluded.lifetime, role_prompt=excluded.role_prompt,
+                 lifetime=excluded.lifetime, role_prompt=excluded.role_prompt, host=excluded.host,
                  updated_ts=excluded.updated_ts""",
             {**cur, "updated_ts": now_iso()})
     print(f"✓ updated {a.slug} → {cur['state']}")
@@ -507,6 +564,7 @@ def cmd_checkpoint(con, a) -> int:
                  blockers=excluded.blockers, updated_ts=excluded.updated_ts""",
             {**{k: cur.get(k) for k in ("slug", "state", "status_line", "next", "blockers")},
              "ts": ts})
+        _beat(con, a.slug)
         if a.review and (a.ask or cur["state"] == "NEEDS-USER"):
             raised = _insert_id(
                 con, "INSERT INTO decisions (stream,question,detail,raised_ts) VALUES (?,?,?,?)",
@@ -788,6 +846,16 @@ def _print_brief(d: dict, slug: str, advance_note: bool = True):
             print(f"  (ack persistent items: `fleet ack --as {slug} --id <n>`)")
 
 
+def _beat(con, slug: str):
+    """Bump the heartbeat on this host's running run for `slug` — the cross-host liveness signal.
+    Called from the worker-facing commands the hooks fire regularly (brief on session start,
+    checkpoint before every stop), so a remote commander can tell a quiet-but-live run apart from
+    a dead one without reaching for its (meaningless-across-hosts) pid. Scoped to THIS host so it
+    can only ever touch our own run row."""
+    con.execute("UPDATE runs SET heartbeat_ts=? WHERE agent_slug=? AND status='running' AND host=?",
+                (now_iso(), slug, _this_host()))
+
+
 def cmd_brief(con, a) -> int:
     d = _brief_data(con, a.slug)
     _print_brief(d, a.slug)
@@ -795,6 +863,7 @@ def cmd_brief(con, a) -> int:
         con.execute("""INSERT INTO read_state (slug,last_read_ts,acked_ids) VALUES (?,?, '[]')
                        ON CONFLICT(slug) DO UPDATE SET last_read_ts=excluded.last_read_ts""",
                     (a.slug, now_iso()))
+        _beat(con, a.slug)
     return 0
 
 
@@ -879,8 +948,12 @@ def cmd_events(con, a) -> int:
 
 
 # ── tasks (v2) ───────────────────────────────────────────────────────────────────────────────
-def _get_task(con, tid: int):
-    return con.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+def _get_task(con, tid: int, for_update: bool = False):
+    # for_update: take a row lock so read-merge-write and guard-then-write sequences are atomic
+    # against a concurrent commander. No-op under SQLite (BEGIN IMMEDIATE already holds the
+    # whole-DB writer lock); a real SELECT … FOR UPDATE under Postgres. Only valid inside a txn.
+    sql = "SELECT * FROM tasks WHERE id=?" + (" FOR UPDATE" if for_update and IS_PG else "")
+    return con.execute(sql, (tid,)).fetchone()
 
 
 def _territories_overlap(t1: str | None, t2: str | None) -> bool:
@@ -984,7 +1057,7 @@ def cmd_task_evidence(con, a) -> int:
         print(f"ERROR: no task #{a.id}", file=sys.stderr)
         return 2
     with write_txn(con):
-        t = _get_task(con, a.id)
+        t = _get_task(con, a.id, for_update=True)
         ev = _loads(t["evidence"], {})
         for key, val in (("test_cmd", a.test_cmd), ("pr", a.pr), ("ci_url", a.ci_url),
                          ("notes", a.notes)):
@@ -1015,48 +1088,59 @@ def _open_review_blockers(con, tid: int) -> list[int]:
 
 
 def cmd_task_set_state(con, a) -> int:
-    t = _get_task(con, a.id)
-    if not t:
-        print(f"ERROR: no task #{a.id}", file=sys.stderr)
-        return 2
     if a.state not in TASK_STATES:
         print(f"ERROR: --state must be one of {TASK_STATES}", file=sys.stderr)
         return 2
+    if not _get_task(con, a.id):
+        print(f"ERROR: no task #{a.id}", file=sys.stderr)
+        return 2
     actor = a.actor or "conductor"
-    ev = _loads(t["evidence"], {})
-    if a.state in GATED_STATES:
-        if actor not in CONDUCTOR_ACTORS:
-            print(f"REFUSED: workers propose; the Conductor disposes. Ask for the gate:\n"
-                  f"  fleet msg --from {actor} --to conductor --kind request --requires-action "
-                  f"--tier FYI --body \"task #{a.id} ready for {a.state}: <evidence summary>\"",
-                  file=sys.stderr)
-            return 2
-        if not ev.get("verified_by_conductor") and not a.force:
-            print(f"REFUSED: evidence not verified. Claims are leads; verified evidence is the "
-                  f"gate.\n  Run: fleet verify --task {a.id}   (or gh run view <ci_url>, then "
-                  f"re-run set-state with --force to accept CI as the verifier)", file=sys.stderr)
-            return 2
-    if a.state == "DONE":
-        blockers = _open_review_blockers(con, a.id)
-        if blockers and not a.force:
-            print(f"REFUSED: open review task(s) {blockers} block DONE (review blocks the merge, "
-                  f"never the author — but it does block DONE).", file=sys.stderr)
-            return 2
-    if a.state == "IN_PROGRESS":
-        unmet = [(d, s) for d, s in _dep_states(con, t) if s not in ("DONE", "PARKED")]
-        if unmet and not a.force:
-            print(f"REFUSED: unmet dependencies {unmet}", file=sys.stderr)
-            return 2
-        if t["repo"]:
-            for o in con.execute(
-                    "SELECT * FROM tasks WHERE state='IN_PROGRESS' AND repo=? AND id!=?",
-                    (t["repo"], a.id)).fetchall():
-                if _territories_overlap(t["territory"], o["territory"]):
-                    print(f"REFUSED: territory overlaps IN_PROGRESS task #{o['id']} "
-                          f"({o['territory'] or 'unscoped'}) in {t['repo']}. Two agents, one "
-                          f"tree = the clip_analysis.py story. Re-scope or wait.", file=sys.stderr)
-                    return 2
+    # Every guard reads INSIDE the transaction, off a FOR-UPDATE re-read of the task, so the state
+    # this call gates on is the same state it writes — no window for a concurrent commander to slip
+    # evidence, a dependency flip, or a rival territory claim between the check and the UPDATE
+    # (architecture §1.2 item 3). A guard that refuses returns from an empty txn — no write lands.
     with write_txn(con):
+        t = _get_task(con, a.id, for_update=True)
+        if not t:
+            print(f"ERROR: no task #{a.id}", file=sys.stderr)
+            return 2
+        ev = _loads(t["evidence"], {})
+        if a.state in GATED_STATES:
+            if actor not in CONDUCTOR_ACTORS:
+                print(f"REFUSED: workers propose; the Conductor disposes. Ask for the gate:\n"
+                      f"  fleet msg --from {actor} --to conductor --kind request --requires-action "
+                      f"--tier FYI --body \"task #{a.id} ready for {a.state}: <evidence summary>\"",
+                      file=sys.stderr)
+                return 2
+            if not ev.get("verified_by_conductor") and not a.force:
+                print(f"REFUSED: evidence not verified. Claims are leads; verified evidence is the "
+                      f"gate.\n  Run: fleet verify --task {a.id}   (or gh run view <ci_url>, then "
+                      f"re-run set-state with --force to accept CI as the verifier)", file=sys.stderr)
+                return 2
+        if a.state == "DONE":
+            blockers = _open_review_blockers(con, a.id)
+            if blockers and not a.force:
+                print(f"REFUSED: open review task(s) {blockers} block DONE (review blocks the "
+                      f"merge, never the author — but it does block DONE).", file=sys.stderr)
+                return 2
+        if a.state == "IN_PROGRESS":
+            unmet = [(d, s) for d, s in _dep_states(con, t) if s not in ("DONE", "PARKED")]
+            if unmet and not a.force:
+                print(f"REFUSED: unmet dependencies {unmet}", file=sys.stderr)
+                return 2
+            if t["repo"]:
+                # The territory scan reads OTHER tasks' rows, so FOR UPDATE on this task can't
+                # serialize it — take turns per repo so two starts can't both pass (write-skew).
+                _serialize_on(con, f"territory:{t['repo']}")
+                for o in con.execute(
+                        "SELECT * FROM tasks WHERE state='IN_PROGRESS' AND repo=? AND id!=?",
+                        (t["repo"], a.id)).fetchall():
+                    if _territories_overlap(t["territory"], o["territory"]):
+                        print(f"REFUSED: territory overlaps IN_PROGRESS task #{o['id']} "
+                              f"({o['territory'] or 'unscoped'}) in {t['repo']}. Two agents, one "
+                              f"tree = the clip_analysis.py story. Re-scope or wait.",
+                              file=sys.stderr)
+                        return 2
         con.execute("UPDATE tasks SET state=?, updated_ts=? WHERE id=?",
                     (a.state, now_iso(), a.id))
         _event(con, actor, "task-state", f"task:{a.id}",
@@ -1092,6 +1176,17 @@ def cmd_verify(con, a) -> int:
               f"its worktree (fleet spawn persists it; or fleet set --slug <slug> --worktree "
               f"<path>).", file=sys.stderr)
         return 2
+    owner_host = _run_host(owner)
+    if owner_host and owner_host != _this_host():
+        # Not a config error — a routing fact. The owner's worktree is an absolute path on
+        # another machine; the test_cmd must run THERE. Refuse politely (distinct exit 3) so the
+        # tick/Conductor can defer the gate to the owning host rather than bounce it as broken
+        # (architecture §1.2 item 4). A local missing-dir is still the hard error below.
+        print(f"DEFERRED: task #{a.id} is owned by host {owner_host} — verify re-runs its "
+              f"evidence in the owner's worktree ({owner['worktree'] or '<unregistered>'}), which "
+              f"lives on {owner_host}, not {_this_host()}. Run `fleet verify --task {a.id}` on "
+              f"{owner_host}.", file=sys.stderr)
+        return 3
     if not owner["worktree"]:
         print(f"ERROR: agent {owner['slug']} has no worktree on record — refusing to run "
               f"evidence from {FLEET_HOME} (that is exactly how valid gates bounce). Fix: "
@@ -1114,7 +1209,7 @@ def cmd_verify(con, a) -> int:
         # The test may run for minutes — re-read evidence INSIDE the lock and merge into the
         # fresh copy. If the worker re-claimed a DIFFERENT test_cmd mid-verify, we verified a
         # stale claim: don't stamp it.
-        ev = _loads(_get_task(con, a.id)["evidence"], {})
+        ev = _loads(_get_task(con, a.id, for_update=True)["evidence"], {})
         if ev.get("test_cmd") != cmd:
             _event(con, "conductor", "gate-stale", f"task:{a.id}",
                    f"claim changed mid-verify (ran `{cmd}`)")
@@ -1381,17 +1476,17 @@ def cmd_spawn(con, a) -> int:
         with write_txn(con):
             con.execute(
                 """INSERT INTO workstreams (slug,state,status_line,branch,product,model,repo,
-                     worktree,lifetime,role_prompt,updated_ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                     worktree,lifetime,role_prompt,host,updated_ts)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(slug) DO UPDATE SET
                      state='ACTIVE', branch=excluded.branch, product=excluded.product,
                      model=COALESCE(excluded.model, workstreams.model),
                      repo=COALESCE(excluded.repo, workstreams.repo),
                      worktree=COALESCE(excluded.worktree, workstreams.worktree),
                      role_prompt=COALESCE(excluded.role_prompt, workstreams.role_prompt),
-                     updated_ts=excluded.updated_ts""",
+                     host=excluded.host, updated_ts=excluded.updated_ts""",
                 (slug, "ACTIVE", f"spawned for task #{t['id']}", branch, product, a.model,
-                 repo, str(wt) if wt else None, lifetime, a.role_prompt, now_iso()))
+                 repo, str(wt) if wt else None, lifetime, a.role_prompt, _this_host(), now_iso()))
             con.execute("UPDATE tasks SET owner_slug=?, branch=?, updated_ts=? WHERE id=?",
                         (slug, branch, now_iso(), t["id"]))
         t = _get_task(con, a.task)
@@ -1425,9 +1520,9 @@ def cmd_spawn(con, a) -> int:
                             start_new_session=True)
     with write_txn(con):
         con.execute("""INSERT INTO runs (agent_slug,task_id,product,model,status,pid,result_ref,
-                        started_ts) VALUES (?,?,?,?,?,?,?,?)""",
+                        host,heartbeat_ts,started_ts) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (slug, t["id"], product, launch_model, "running", proc.pid, str(out),
-                     now_iso()))
+                     _this_host(), now_iso(), now_iso()))
         _event(con, "conductor", "spawn", f"agent:{slug}",
                f"task:{t['id']} pid:{proc.pid} model:{launch_model or 'default'}")
     print(f"✓ spawned {slug} (pid {proc.pid}, task #{t['id']}) → {out}\n  harvest later: fleet harvest")
@@ -1447,6 +1542,16 @@ def cmd_run(con, a) -> int:
     if not agent["session_id"] and not a.fresh:
         print(f"ERROR: {a.agent} has no session to resume (pass --fresh to start one, or spawn)",
               file=sys.stderr)
+        return 2
+    # Resume is host-pinned. A claude/codex session_id resumes ONLY on the machine that created
+    # it (the transcript lives in that host's ~/.claude); resuming it elsewhere silently starts a
+    # blank conversation. If this agent's session belongs to another host, refuse and point there
+    # — --fresh (a new session, no resume) is the escape hatch to re-home it. (Architecture §1.2.5.)
+    agent_host = _run_host(agent)
+    if not a.fresh and agent["session_id"] and agent_host and agent_host != _this_host():
+        print(f"REFUSED: {a.agent}'s session is pinned to host {agent_host} — a session resumes "
+              f"only on the machine that created it. Resume on {agent_host}, or pass --fresh to "
+              f"start a new session here.", file=sys.stderr)
         return 2
     text = sys.stdin.read() if a.input == "-" else a.input
     if not text:
@@ -1479,9 +1584,14 @@ def cmd_run(con, a) -> int:
                             stderr=subprocess.STDOUT, start_new_session=True)
     with write_txn(con):
         con.execute("""INSERT INTO runs (agent_slug,task_id,product,model,status,pid,result_ref,
-                        started_ts) VALUES (?,?,?,?,?,?,?,?)""",
+                        host,heartbeat_ts,started_ts) VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (a.agent, a.task, agent["product"] or "claude", agent["model"], "running",
-                     proc.pid, str(out), now_iso()))
+                     proc.pid, str(out), _this_host(), now_iso(), now_iso()))
+        # The live session now lives on THIS host (a fresh session re-homes a formerly-remote
+        # agent; a pinned resume was already local). Keep workstreams.host in step so verify and
+        # the next resume-pin check agree on where the worktree + session physically are.
+        con.execute("UPDATE workstreams SET host=?, updated_ts=? WHERE slug=?",
+                    (_this_host(), now_iso(), a.agent))
         _event(con, "conductor", "resume", f"agent:{a.agent}", f"pid:{proc.pid}")
     print(f"✓ resumed {a.agent} (pid {proc.pid}) → {out}")
     return 0
@@ -1497,6 +1607,23 @@ def _pid_alive(pid: int | None) -> bool:
         return False
     except OSError:
         return False
+
+
+def _run_host(run) -> str | None:
+    return run["host"] if run is not None and "host" in run.keys() else None
+
+
+def _run_alive(run) -> bool:
+    """Is this run still alive, judged correctly across hosts? A LOCAL run (this host, or a
+    legacy NULL-host row that can only be ours) gets the authoritative pid check. A REMOTE run's
+    pid is meaningless here — judge it by heartbeat freshness instead. This is what keeps host B
+    from ever declaring host A's live run dead (and reaping the lease it guards)."""
+    if run is None:
+        return False
+    host = _run_host(run)
+    if host is None or host == _this_host():
+        return _pid_alive(run["pid"])
+    return _heartbeat_fresh(run["heartbeat_ts"] if "heartbeat_ts" in run.keys() else None)
 
 
 def _parse_result(path: Path) -> dict | None:
@@ -1522,13 +1649,19 @@ def _parse_result(path: Path) -> dict | None:
 
 
 def cmd_harvest(con, a) -> int:
-    rows = con.execute("SELECT * FROM runs WHERE status='running'").fetchall()
+    # Host-scoped: harvest only THIS host's runs. A run's pid (and its result_ref file) live on
+    # the machine that spawned it — harvesting another host's runs would mark its live sessions
+    # failed off a meaningless local pid check and read a result file that isn't here. NULL host
+    # = a legacy/pre-migration row, which can only be ours, so include it. (Architecture §1.2.2.)
+    rows = con.execute(
+        "SELECT * FROM runs WHERE status='running' AND (host IS NULL OR host=?)",
+        (_this_host(),)).fetchall()
     if not rows:
         print("(no running sessions)")
         return 0
     n_done = 0
     for r in rows:
-        if _pid_alive(r["pid"]):
+        if _run_alive(r):
             print(f"  ⏳ run #{r['id']} {r['agent_slug']} still running (pid {r['pid']})")
             continue
         res = _parse_result(Path(r["result_ref"])) if r["result_ref"] else None
@@ -1595,9 +1728,9 @@ def _active_lease(con, resource: str):
 
 def _holder_run_alive(con, slug: str) -> bool:
     row = con.execute(
-        "SELECT pid FROM runs WHERE agent_slug=? AND status='running' ORDER BY id DESC LIMIT 1",
-        (slug,)).fetchone()
-    return bool(row and _pid_alive(row["pid"]))
+        "SELECT pid, host, heartbeat_ts FROM runs WHERE agent_slug=? AND status='running' "
+        "ORDER BY id DESC LIMIT 1", (slug,)).fetchone()
+    return _run_alive(row)
 
 
 def _lease_is_stale(con, row) -> bool:
@@ -1617,35 +1750,47 @@ def cmd_lease_acquire(con, a) -> int:
               f"--device {pinned}.", file=sys.stderr)
         return 2
     device = a.device or pinned
-    with write_txn(con):
-        cur = _active_lease(con, a.resource)
-        if cur and cur["holder_slug"] == a.slug:
-            con.execute("UPDATE leases SET acquired_ts=?, ttl_seconds=? WHERE id=?",
-                        (now_iso(), a.ttl or cur["ttl_seconds"], cur["id"]))
-            _event(con, a.slug, "lease-refresh", a.resource, device)
-            print(f"✓ refreshed lease #{cur['id']} on {a.resource} for {a.slug}"
-                  + (f" (device {device})" if device else ""))
-            return 0
-        if cur and not _lease_is_stale(con, cur):
-            print(f"REFUSED: {a.resource} is held by {cur['holder_slug']} (lease #{cur['id']}, "
-                  f"acquired {ago(cur['acquired_ts'])}). The Conductor owns visual QA by "
-                  f"default — only lease when YOUR brief explicitly grants it; if it does, wait "
-                  f"for {cur['holder_slug']} to release, or ask them via `fleet msg`.",
-                  file=sys.stderr)
-            return 2
-        if cur:
-            con.execute("UPDATE leases SET released_ts=? WHERE id=?", (now_iso(), cur["id"]))
-            _event(con, "conductor", "lease-reap", a.resource,
-                   f"stale holder {cur['holder_slug']} (lease #{cur['id']}) reaped before "
-                   f"{a.slug} acquired")
-            print(f"  ↻ reaped stale lease #{cur['id']} ({cur['holder_slug']}) first",
-                  file=sys.stderr)
-        ttl = a.ttl or LEASE_DEFAULT_TTL
-        lid = _insert_id(
-            con,
-            """INSERT INTO leases (resource,holder_slug,device,acquired_ts,ttl_seconds)
-               VALUES (?,?,?,?,?)""", (a.resource, a.slug, device, now_iso(), ttl))
-        _event(con, a.slug, "lease-acquire", a.resource, device)
+    ttl = a.ttl or LEASE_DEFAULT_TTL
+    try:
+        with write_txn(con):
+            cur = _active_lease(con, a.resource)
+            if cur and cur["holder_slug"] == a.slug:
+                con.execute("UPDATE leases SET acquired_ts=?, ttl_seconds=? WHERE id=?",
+                            (now_iso(), a.ttl or cur["ttl_seconds"], cur["id"]))
+                _event(con, a.slug, "lease-refresh", a.resource, device)
+                print(f"✓ refreshed lease #{cur['id']} on {a.resource} for {a.slug}"
+                      + (f" (device {device})" if device else ""))
+                return 0
+            if cur and not _lease_is_stale(con, cur):
+                print(f"REFUSED: {a.resource} is held by {cur['holder_slug']} (lease #{cur['id']}, "
+                      f"acquired {ago(cur['acquired_ts'])}). The Conductor owns visual QA by "
+                      f"default — only lease when YOUR brief explicitly grants it; if it does, wait "
+                      f"for {cur['holder_slug']} to release, or ask them via `fleet msg`.",
+                      file=sys.stderr)
+                return 2
+            if cur:
+                con.execute("UPDATE leases SET released_ts=? WHERE id=?", (now_iso(), cur["id"]))
+                _event(con, "conductor", "lease-reap", a.resource,
+                       f"stale holder {cur['holder_slug']} (lease #{cur['id']}) reaped before "
+                       f"{a.slug} acquired")
+                print(f"  ↻ reaped stale lease #{cur['id']} ({cur['holder_slug']}) first",
+                      file=sys.stderr)
+            # The INSERT is the mutex: uq_leases_active (one unreleased row per resource) makes
+            # this atomic across commanders. If a rival on another host slipped its own acquire in
+            # between our _active_lease read and here, this raises a unique violation — exactly one
+            # acquire wins; the loser is told the truth rather than double-holding (§1.2 item 3).
+            lid = _insert_id(
+                con,
+                """INSERT INTO leases (resource,holder_slug,device,host,acquired_ts,ttl_seconds)
+                   VALUES (?,?,?,?,?,?)""",
+                (a.resource, a.slug, device, _this_host(), now_iso(), ttl))
+            _event(con, a.slug, "lease-acquire", a.resource, device)
+    except _UNIQUE_VIOLATION:
+        holder = _active_lease(con, a.resource)
+        who = holder["holder_slug"] if holder else "another commander"
+        print(f"REFUSED: {a.resource} was just acquired by {who} — the DB lease mutex admits "
+              f"exactly one holder. Wait for release, or ask via `fleet msg`.", file=sys.stderr)
+        return 2
     print(f"✓ lease #{lid}: {a.resource} → {a.slug}" + (f" (device {device})" if device else "")
           + f", ttl {ttl}s — release the moment you're done: fleet lease release --resource "
             f"{a.resource} --as {a.slug}")
