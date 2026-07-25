@@ -23,6 +23,20 @@ FLEET = HERE.parent / "fleet.py"
 HOOKS = HERE.parent / "hooks"
 PY = sys.executable
 
+# Dual-backend: the suite runs against SQLite (default) OR a local Postgres when FLEET_PG_TEST is
+# set to a postgres:// DSN. Under Postgres each test gets a clean database by resetting the public
+# schema in setUp; the raw-SQL test helpers (q/raw_exec) route to psycopg with `?`→`%s`.
+PG_DSN = os.environ.get("FLEET_PG_TEST") or None
+USE_PG = bool(PG_DSN)
+if USE_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+
+
+def _pg(sql: str) -> str:
+    """Translate the SQLite placeholders the tests use (`?` only) for psycopg."""
+    return sql.replace("%", "%%").replace("?", "%s")
+
 
 class FleetCase(unittest.TestCase):
     def setUp(self):
@@ -33,9 +47,16 @@ class FleetCase(unittest.TestCase):
         self.workspace.mkdir()
         self.runs = root / "runs"
         self.waiting = root / "WAITING_ON_YOU.md"
+        if USE_PG:
+            self._pg_reset()
+        db_setting = PG_DSN if USE_PG else str(self.db)
+        # Hermetic env: drop any ambient FLEET_* (a fleet worker running the suite exports
+        # FLEET_SLUG/FLEET_TASK/FLEET_DB, which would otherwise leak into the CLI + hook
+        # subprocesses). Everything the suite needs is set explicitly below.
+        base_env = {k: v for k, v in os.environ.items() if not k.startswith("FLEET_")}
         self.env = {
-            **os.environ,
-            "FLEET_DB": str(self.db),
+            **base_env,
+            "FLEET_DB": db_setting,
             "FLEET_WORKSPACE": str(self.workspace),
             "FLEET_RUNS_DIR": str(self.runs),
             "FLEET_WORKTREES": str(self.workspace / ".worktrees"),
@@ -56,13 +77,34 @@ class FleetCase(unittest.TestCase):
                              f"fleet {' '.join(args)}\nstdout: {r.stdout}\nstderr: {r.stderr}")
         return r
 
+    def _pg_reset(self):
+        """Give each test a clean database by dropping and recreating the public schema."""
+        with psycopg.connect(PG_DSN, autocommit=True) as con:
+            con.execute("DROP SCHEMA IF EXISTS public CASCADE")
+            con.execute("CREATE SCHEMA public")
+
     def q(self, sql, params=()):
+        if USE_PG:
+            with psycopg.connect(PG_DSN, autocommit=True, row_factory=dict_row) as con:
+                return [dict(r) for r in con.execute(_pg(sql), params).fetchall()]
         con = sqlite3.connect(self.db)
         con.row_factory = sqlite3.Row
         try:
             return [dict(r) for r in con.execute(sql, params).fetchall()]
         finally:
             con.close()
+
+    def raw_exec(self, sql, params=()):
+        """Write directly to the DB (bypassing the CLI) — for setting up fixtures like a stale
+        'running' run row. Routes to whichever backend is under test."""
+        if USE_PG:
+            with psycopg.connect(PG_DSN, autocommit=True) as con:
+                con.execute(_pg(sql), params)
+            return
+        con = sqlite3.connect(self.db)
+        con.execute(sql, params)
+        con.commit()
+        con.close()
 
     def add_task(self, objective="do the thing", kind="implement", **kw):
         args = ["task", "add", "--objective", objective, "--kind", kind,
@@ -85,6 +127,7 @@ class TestSchema(FleetCase):
         self.fleet("status")
         self.fleet("status")  # second connect re-runs SCHEMA + migrations without error
 
+    @unittest.skipIf(USE_PG, "legacy fleet.db in-place upgrade is a SQLite-only adoption path")
     def test_v1_db_upgrades_in_place(self):
         con = sqlite3.connect(self.db)  # minimal v1-shaped tables (no v2 columns)
         con.executescript("""
@@ -363,10 +406,8 @@ class TestRunner(FleetCase):
 
     def test_run_refused_while_running(self):
         self.fleet("set", "--slug", "lane-x", "--state", "ACTIVE", "--session-id", "sess-1")
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
-                    "VALUES ('lane-x','claude','running',999999999,'2026-01-01')")
-        con.commit(); con.close()
+        self.raw_exec("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
+                      "VALUES ('lane-x','claude','running',999999999,'2026-01-01')")
         r = self.fleet("run", "--agent", "lane-x", "--input", "continue", expect=2)
         self.assertIn("already running", r.stderr)
 
@@ -375,10 +416,8 @@ class TestRunner(FleetCase):
         bad = self.runs / "bad.json"
         self.runs.mkdir(parents=True, exist_ok=True)
         bad.write_text("worker exploded, no json here")
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO runs (agent_slug,product,status,pid,result_ref,started_ts) "
-                    "VALUES ('lane-x','claude','running',999999999,?, '2026-01-01')", (str(bad),))
-        con.commit(); con.close()
+        self.raw_exec("INSERT INTO runs (agent_slug,product,status,pid,result_ref,started_ts) "
+                      "VALUES ('lane-x','claude','running',999999999,?, '2026-01-01')", (str(bad),))
         # pid 999999999 is dead on any sane box → parse fails → failed
         out = self.fleet("harvest").stdout
         self.assertIn("FAILED", out)
@@ -630,10 +669,8 @@ class TestReviewPolicy(FleetCase):
 class TestLeases(FleetCase):
     def _insert_run(self, slug, pid, status="running"):
         self.fleet("status")   # ensure the schema (incl. runs) exists before the raw INSERT
-        con = sqlite3.connect(self.db)
-        con.execute("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
-                    "VALUES (?,'claude',?,?,'2026-01-01')", (slug, status, pid))
-        con.commit(); con.close()
+        self.raw_exec("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
+                      "VALUES (?,'claude',?,?,'2026-01-01')", (slug, status, pid))
 
     def test_acquire_then_status_shows_holder(self):
         self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")

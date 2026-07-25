@@ -40,12 +40,28 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
+
+# psycopg (v3) is only needed when FLEET_DB is a postgres:// DSN. Keep it a soft dependency so
+# the SQLite default (tests, offline) runs with the stdlib alone.
+try:
+    import psycopg
+    _HAVE_PSYCOPG = True
+except ImportError:
+    psycopg = None
+    _HAVE_PSYCOPG = False
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 FLEET_HOME = Path(__file__).resolve().parent
 WORKSPACE = Path(os.environ.get("FLEET_WORKSPACE", str(FLEET_HOME.parent)))  # …/<workspace>
-DB_PATH = Path(os.environ.get("FLEET_DB", str(FLEET_HOME / "fleet.db")))
+# The single backend seam. FLEET_DB is either a filesystem path (SQLite — the default, used by
+# tests and offline) or a `postgres://`/`postgresql://` DSN (shared cloud DB). Everything else in
+# this module is backend-agnostic; the only dialect-aware code lives in the connection layer
+# below (connect/run_migrations/write_txn + the _pg_* helpers).
+FLEET_DB = os.environ.get("FLEET_DB", str(FLEET_HOME / "fleet.db"))
+IS_PG = FLEET_DB.startswith(("postgres://", "postgresql://"))
+DB_PATH = None if IS_PG else Path(FLEET_DB)  # None under Postgres; a real path under SQLite
+MIGRATIONS_DIR = Path(os.environ.get("FLEET_MIGRATIONS_DIR", str(FLEET_HOME / "migrations")))
 RUNS_DIR = Path(os.environ.get("FLEET_RUNS_DIR", str(FLEET_HOME / "runs")))
 WORKTREES = Path(os.environ.get("FLEET_WORKTREES", str(WORKSPACE / ".worktrees")))
 WAITING_OUT = Path(os.environ.get("FLEET_WAITING_OUT", str(WORKSPACE / "WAITING_ON_YOU.md")))
@@ -101,120 +117,16 @@ LEASE_DEVICES = dict(
 # suspenders. Configure with FLEET_LEASE_TTL_SECONDS; default 30 minutes.
 LEASE_DEFAULT_TTL = int(os.environ.get("FLEET_LEASE_TTL_SECONDS", "1800"))
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS workstreams (
-  slug         TEXT PRIMARY KEY,
-  owner        TEXT,
-  layer        TEXT,
-  state        TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE','BLOCKED','NEEDS-USER','PARKED')),
-  status_line  TEXT,
-  next         TEXT,
-  blockers     TEXT,
-  branch       TEXT,
-  kestral_id   TEXT,
-  updated_ts   TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS decisions (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  stream       TEXT,
-  question     TEXT NOT NULL,
-  detail       TEXT,
-  raised_ts    TEXT NOT NULL,
-  resolved_ts  TEXT,
-  resolution   TEXT,
-  kestral_id   TEXT
-);
-CREATE TABLE IF NOT EXISTS messages (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  from_stream  TEXT NOT NULL,
-  to_addr      TEXT NOT NULL,
-  tier         TEXT NOT NULL CHECK (tier IN ('FYI','BLOCKER','NEEDS-USER','PROTOCOL')),
-  body         TEXT NOT NULL,
-  ref          TEXT,
-  ts           TEXT NOT NULL,
-  resolved_ts  TEXT
-);
-CREATE TABLE IF NOT EXISTS read_state (
-  slug         TEXT PRIMARY KEY,
-  last_read_ts TEXT,
-  acked_ids    TEXT NOT NULL DEFAULT '[]'
-);
-CREATE TABLE IF NOT EXISTS updates (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  slug         TEXT NOT NULL,
-  did          TEXT, files TEXT, found TEXT, next TEXT, review TEXT, blockers TEXT,
-  state        TEXT, ref TEXT,
-  ts           TEXT NOT NULL
-);
--- v2: the spine. Tasks flow; agents execute. The state machine lives HERE, not on agents.
-CREATE TABLE IF NOT EXISTS tasks (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  objective     TEXT NOT NULL,
-  kind          TEXT NOT NULL CHECK (kind IN
-                  ('implement','review','test','deploy','doc','investigate','decide')),
-  state         TEXT NOT NULL DEFAULT 'QUEUED' CHECK (state IN
-                  ('QUEUED','IN_PROGRESS','IN_REVIEW','BLOCKED','NEEDS_HUMAN','DONE','PARKED')),
-  owner_slug    TEXT,
-  repo          TEXT,
-  territory     TEXT,
-  branch        TEXT,
-  depends_on    TEXT NOT NULL DEFAULT '[]',
-  done_criteria TEXT NOT NULL,
-  dont_touch    TEXT,
-  context_refs  TEXT NOT NULL DEFAULT '[]',
-  evidence      TEXT NOT NULL DEFAULT '{}',
-  budget_usd    REAL,
-  spent_usd     REAL NOT NULL DEFAULT 0,
-  parent_id     INTEGER,
-  created_ts    TEXT NOT NULL,
-  updated_ts    TEXT NOT NULL
-);
--- v2: session ledger — one row per headless worker run (cost + liveness record).
-CREATE TABLE IF NOT EXISTS runs (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  agent_slug    TEXT NOT NULL,
-  task_id       INTEGER,
-  product       TEXT NOT NULL CHECK (product IN ('claude','codex')),
-  model         TEXT,
-  session_id    TEXT,
-  status        TEXT NOT NULL CHECK (status IN ('running','finished','failed','abandoned')),
-  pid           INTEGER,
-  cost_usd      REAL,
-  num_turns     INTEGER,
-  result_ref    TEXT,
-  started_ts    TEXT NOT NULL,
-  ended_ts      TEXT
-);
--- v2: Conductor action log (append-only; the founder's audit surface for Conductor judgment).
-CREATE TABLE IF NOT EXISTS events (
-  id      INTEGER PRIMARY KEY AUTOINCREMENT,
-  actor   TEXT NOT NULL,
-  action  TEXT NOT NULL,
-  subject TEXT,
-  detail  TEXT,
-  ts      TEXT NOT NULL
-);
--- v2: exclusive shared-resource mutex (e.g. one iOS simulator many lanes must take turns on).
--- One row per acquisition (not one row per resource) so the history stays an audit trail;
--- "the" lease on a resource is its newest row with released_ts IS NULL.
-CREATE TABLE IF NOT EXISTS leases (
-  id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  resource     TEXT NOT NULL,
-  holder_slug  TEXT NOT NULL,
-  device       TEXT,
-  acquired_ts  TEXT NOT NULL,
-  ttl_seconds  INTEGER NOT NULL,
-  released_ts  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_addr, ts);
-CREATE INDEX IF NOT EXISTS idx_messages_tier ON messages(tier, resolved_ts);
-CREATE INDEX IF NOT EXISTS idx_updates_slug ON updates(slug, ts);
-CREATE INDEX IF NOT EXISTS idx_tasks_state ON tasks(state);
-CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
-CREATE INDEX IF NOT EXISTS idx_leases_resource ON leases(resource, released_ts);
-"""
-
-# Idempotent column adds so an existing v1 fleet.db upgrades in place on first connect.
+# The full current schema lives in versioned SQL files under migrations/ (0001_initial.sql is
+# the whole thing). run_migrations() applies each file exactly once, tracked in a
+# schema_migrations table — no more executescript on every invocation.
+#
+# _MIGRATIONS below is NOT re-applied per connect anymore. It is the reconciliation target for
+# adopting a *pre-versioning* fleet.db (tables created by the old executescript path, before
+# schema_migrations existed): when the base migration is first applied to such a DB,
+# _ensure_columns() adds any of these columns the legacy tables are missing. Fresh DBs already
+# have every column from 0001_initial.sql, so this is a no-op for them. Keep it in sync with the
+# column set in migrations/0001_initial.sql.
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("workstreams", "product",    "TEXT DEFAULT 'claude'"),
     ("workstreams", "model",      "TEXT"),
@@ -277,28 +189,175 @@ def is_stale(ts: str | None) -> bool:
     return bool(dt and (datetime.now(timezone.utc) - dt).days > STALE_DAYS)
 
 
-# ── connection + concurrency-safe writes (v1 core, + v2 migrations) ─────────────────────────
-def connect() -> sqlite3.Connection:
+# ── dual backend: SQLite (default) or Postgres (FLEET_DB=postgres://…) ───────────────────────
+# Both paths present the same tiny DB-API surface to the rest of the module: con.execute(sql,
+# params) returning a cursor with .fetchone()/.fetchall()/iteration, plus con.commit()/rollback()/
+# close(). SQL is written ONCE in SQLite dialect (`?`/`:name` placeholders); under Postgres the
+# _PGConn wrapper rewrites placeholders to psycopg's `%s`/`%(name)s` on the way through. Rows are
+# mapping-like on both backends AND support integer indexing (row[0]) so aggregate reads like
+# `SELECT COUNT(*) … .fetchone()[0]` work unchanged.
+
+class _PGRow(dict):
+    """A result row that behaves like both a dict (row['col'], dict(row)) and a tuple (row[0]) —
+    matching sqlite3.Row, so call sites need no per-backend branching."""
+    def __init__(self, cols, values):
+        super().__init__(zip(cols, values))
+        self._vals = tuple(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return super().__getitem__(key)
+
+
+def _pg_row_factory(cursor):
+    cols = [c.name for c in cursor.description] if cursor.description else []
+    return lambda values: _PGRow(cols, values)
+
+
+def _pg_translate(sql: str) -> str:
+    """Rewrite SQLite-style placeholders to psycopg's. Order matters: double any literal `%`
+    FIRST (psycopg treats `%` specially when params are bound), then introduce `%s`/`%(name)s`."""
+    sql = sql.replace("%", "%%")
+    sql = sql.replace("?", "%s")
+    sql = re.sub(r":(\w+)", r"%(\1)s", sql)
+    return sql
+
+
+def _pg_ddl(sql: str) -> str:
+    """Translate the SQLite-dialect migration DDL to Postgres: AUTOINCREMENT integer PKs become
+    identity columns. Everything else in the schema is already portable (TEXT/REAL/INTEGER, CHECK,
+    ON CONFLICT, IF NOT EXISTS)."""
+    return re.sub(r"\bAUTOINCREMENT\b", "GENERATED BY DEFAULT AS IDENTITY", sql)
+
+
+class _PGConn:
+    """Thin wrapper over a psycopg connection giving it the sqlite3.Connection surface this module
+    uses, with placeholder translation on every execute."""
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, params=None):
+        return self._raw.execute(_pg_translate(sql), params)
+
+    def transaction(self):
+        return self._raw.transaction()
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        self._raw.close()
+
+
+def _split_sql(script: str) -> list[str]:
+    """Split a DDL script into individual statements. Strips `--` line comments; our schema has no
+    semicolons or `--` inside string literals, so a plain split is safe."""
+    lines = []
+    for ln in script.splitlines():
+        i = ln.find("--")
+        lines.append(ln[:i] if i >= 0 else ln)
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
+
+
+def _table_columns(con, table: str) -> set[str]:
+    if IS_PG:
+        rows = con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name=?", (table,)).fetchall()
+        return {r[0] for r in rows}
+    return {r["name"] for r in con.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _ensure_columns(con):
+    """Heal a pre-versioning fleet.db: add any _MIGRATIONS columns its legacy tables are missing.
+    Idempotent (catalog-driven) and only invoked once, when the base migration is first applied."""
+    have: dict[str, set[str]] = {}
+    for table, col, ddl in _MIGRATIONS:
+        if table not in have:
+            have[table] = _table_columns(con, table)
+        if col not in have[table]:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+            have[table].add(col)
+
+
+def run_migrations(con):
+    """Apply each migrations/*.sql file exactly once, tracked in schema_migrations. Replaces the
+    old per-invocation executescript(SCHEMA). Files are named NNNN_description.sql and applied in
+    numeric order."""
+    con.execute("CREATE TABLE IF NOT EXISTS schema_migrations ("
+                "version INTEGER PRIMARY KEY, applied_ts TEXT NOT NULL)")
+    if not IS_PG:
+        con.commit()
+    applied = {r[0] for r in con.execute("SELECT version FROM schema_migrations").fetchall()}
+    newly = 0
+    for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        version = int(f.name.split("_", 1)[0])
+        if version in applied:
+            continue
+        script = f.read_text()
+        if IS_PG:
+            script = _pg_ddl(script)
+        stmts = _split_sql(script)
+        record = ("INSERT INTO schema_migrations (version, applied_ts) VALUES (?,?) "
+                  "ON CONFLICT(version) DO NOTHING")
+        if IS_PG:
+            with con.transaction():
+                for stmt in stmts:
+                    con.execute(stmt)
+                con.execute(record, (version, now_iso()))
+        else:
+            for stmt in stmts:
+                con.execute(stmt)
+            con.execute(record, (version, now_iso()))
+            con.commit()
+        newly += 1
+    if newly:
+        # A newly-applied base migration on an adopted legacy DB leaves old tables missing the v2
+        # columns (CREATE TABLE IF NOT EXISTS won't alter them) — reconcile once, here.
+        _ensure_columns(con)
+        if not IS_PG:
+            con.commit()
+
+
+def connect():
+    if IS_PG:
+        if not _HAVE_PSYCOPG:
+            print("ERROR: FLEET_DB is a postgres:// URL but psycopg (v3) is not installed "
+                  "(pip install 'psycopg[binary]')", file=sys.stderr)
+            raise SystemExit(2)
+        con = _PGConn(psycopg.connect(FLEET_DB, autocommit=True, row_factory=_pg_row_factory))
+        run_migrations(con)
+        return con
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(DB_PATH, timeout=5.0)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
     con.execute("PRAGMA busy_timeout=5000;")
     con.execute("PRAGMA foreign_keys=ON;")
-    con.executescript(SCHEMA)
-    existing: dict[str, set[str]] = {}
-    for table, col, ddl in _MIGRATIONS:
-        if table not in existing:
-            existing[table] = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
-        if col not in existing[table]:
-            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
-            existing[table].add(col)
-    con.commit()
+    run_migrations(con)
     return con
 
 
+def _insert_id(con, sql: str, params):
+    """INSERT a row and return its new integer primary key, portably. SQLite uses cursor.lastrowid;
+    Postgres has no lastrowid, so append RETURNING id and read it back."""
+    if IS_PG:
+        return con.execute(sql + " RETURNING id", params).fetchone()[0]
+    return con.execute(sql, params).lastrowid
+
+
 @contextmanager
-def write_txn(con: sqlite3.Connection):
+def write_txn(con):
+    """A serialized write transaction. SQLite: BEGIN IMMEDIATE takes the whole-DB writer lock.
+    Postgres (autocommit connection): a real transaction block via psycopg's .transaction()."""
+    if IS_PG:
+        with con.transaction():
+            yield
+        return
     con.execute("BEGIN IMMEDIATE;")
     try:
         yield
@@ -449,11 +508,11 @@ def cmd_checkpoint(con, a) -> int:
             {**{k: cur.get(k) for k in ("slug", "state", "status_line", "next", "blockers")},
              "ts": ts})
         if a.review and (a.ask or cur["state"] == "NEEDS-USER"):
-            c = con.execute("INSERT INTO decisions (stream,question,detail,raised_ts) VALUES (?,?,?,?)",
-                            (a.slug, a.review, a.found or a.did, ts))
+            raised = _insert_id(
+                con, "INSERT INTO decisions (stream,question,detail,raised_ts) VALUES (?,?,?,?)",
+                (a.slug, a.review, a.found or a.did, ts))
             con.execute("UPDATE workstreams SET state='NEEDS-USER', updated_ts=? WHERE slug=?",
                         (ts, a.slug))
-            raised = c.lastrowid
     print(f"✓ checkpoint logged for {a.slug} @ {ts} (state {cur['state']})"
           + (f"; raised decision #{raised} (waiting on human)" if raised else ""))
     return 0
@@ -477,7 +536,8 @@ def cmd_msg(con, a) -> int:
             print(f"ERROR: --supersedes {a.supersedes}: no such message", file=sys.stderr)
             return 2
     with write_txn(con):
-        c = con.execute(
+        msg_id = _insert_id(
+            con,
             """INSERT INTO messages (from_stream,to_addr,tier,body,ref,ts,kind,requires_action,
                  supersedes_id,verified) VALUES (?,?,?,?,?,?,?,?,?,?)""",
             (a.from_stream, a.to, a.tier, a.body, a.ref, now_iso(),
@@ -488,7 +548,7 @@ def cmd_msg(con, a) -> int:
                         (now_iso(), a.supersedes))
     flags = "".join([" ⚡action" if a.requires_action else "",
                      f" ⤿supersedes #{a.supersedes}" if a.supersedes else ""])
-    print(f"✓ msg #{c.lastrowid} [{a.tier}/{a.kind}] {a.from_stream} → {a.to}{flags}")
+    print(f"✓ msg #{msg_id} [{a.tier}/{a.kind}] {a.from_stream} → {a.to}{flags}")
     return 0
 
 
@@ -508,7 +568,8 @@ def cmd_decide(con, a) -> int:
             return 2
         expires = (datetime.now(timezone.utc) + timedelta(hours=a.expires)).isoformat(timespec="seconds")
     with write_txn(con):
-        c = con.execute(
+        dec_id = _insert_id(
+            con,
             """INSERT INTO decisions (stream,question,detail,raised_ts,default_recommendation,
                  reversible,expires_ts,category,task_id) VALUES (?,?,?,?,?,?,?,?,?)""",
             (a.stream, a.question, a.detail, now_iso(), a.default,
@@ -520,7 +581,7 @@ def cmd_decide(con, a) -> int:
             con.execute("UPDATE tasks SET state='NEEDS_HUMAN', updated_ts=? WHERE id=?",
                         (now_iso(), a.task))
     tail = f" (default: {a.default}; auto-proceeds {a.expires}h)" if expires else ""
-    print(f"✓ decision #{c.lastrowid} raised (waiting on human){tail}")
+    print(f"✓ decision #{dec_id} raised (waiting on human){tail}")
     return 0
 
 
@@ -632,10 +693,16 @@ def _brief_data(con, slug: str) -> dict:
         (slug,)).fetchall()
     # >= not >: timestamps are second-resolution, and a resolve landing in the same second as
     # the agent's last brief must still be DELIVERED (showing an answer twice beats never).
-    answered = con.execute(
-        "SELECT * FROM decisions WHERE stream=? AND resolved_ts IS NOT NULL "
-        "AND (? IS NULL OR resolved_ts >= ?) ORDER BY resolved_ts",
-        (slug, last_read, last_read)).fetchall()
+    # (Branch in Python rather than `? IS NULL OR …` — a bare param next to IS NULL has no type
+    # context for Postgres to infer, and SQLite's loose typing hid that.)
+    if last_read is None:
+        answered = con.execute(
+            "SELECT * FROM decisions WHERE stream=? AND resolved_ts IS NOT NULL "
+            "ORDER BY resolved_ts", (slug,)).fetchall()
+    else:
+        answered = con.execute(
+            "SELECT * FROM decisions WHERE stream=? AND resolved_ts IS NOT NULL "
+            "AND resolved_ts >= ? ORDER BY resolved_ts", (slug, last_read)).fetchall()
     last_update = con.execute(
         "SELECT * FROM updates WHERE slug=? ORDER BY ts DESC LIMIT 1", (slug,)).fetchone()
     tasks = con.execute(
@@ -843,14 +910,15 @@ def cmd_task_add(con, a) -> int:
            for p in (a.context or [])]
     ts = now_iso()
     with write_txn(con):
-        c = con.execute(
+        task_id = _insert_id(
+            con,
             """INSERT INTO tasks (objective,kind,state,owner_slug,repo,territory,branch,depends_on,
                  done_criteria,dont_touch,context_refs,budget_usd,parent_id,created_ts,updated_ts)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (a.objective, a.kind, "QUEUED", a.owner, a.repo, a.territory, a.branch,
              json.dumps(deps), a.done, a.dont_touch, json.dumps(ctx), a.budget, a.parent, ts, ts))
-        _event(con, a.actor or "conductor", "task-add", f"task:{c.lastrowid}", a.objective)
-    print(f"✓ task #{c.lastrowid} [{a.kind}] QUEUED — {a.objective}")
+        _event(con, a.actor or "conductor", "task-add", f"task:{task_id}", a.objective)
+    print(f"✓ task #{task_id} [{a.kind}] QUEUED — {a.objective}")
     return 0
 
 
@@ -1349,7 +1417,7 @@ def cmd_spawn(con, a) -> int:
         return 0
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out = RUNS_DIR / f"{slug}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    env = {**os.environ, "FLEET_SLUG": slug, "FLEET_DB": str(DB_PATH),
+    env = {**os.environ, "FLEET_SLUG": slug, "FLEET_DB": FLEET_DB,
            "FLEET_TASK": str(t["id"])}
     launch_model = a.model or (agent["model"] if "model" in agent.keys() else None)
     proc = subprocess.Popen(cmd, cwd=str(wt) if wt else str(FLEET_HOME), env=env,
@@ -1406,7 +1474,7 @@ def cmd_run(con, a) -> int:
               f"work", file=sys.stderr)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     out = RUNS_DIR / f"{a.agent}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
-    env = {**os.environ, "FLEET_SLUG": a.agent, "FLEET_DB": str(DB_PATH)}
+    env = {**os.environ, "FLEET_SLUG": a.agent, "FLEET_DB": FLEET_DB}
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=open(out, "w"),
                             stderr=subprocess.STDOUT, start_new_session=True)
     with write_txn(con):
@@ -1573,9 +1641,10 @@ def cmd_lease_acquire(con, a) -> int:
             print(f"  ↻ reaped stale lease #{cur['id']} ({cur['holder_slug']}) first",
                   file=sys.stderr)
         ttl = a.ttl or LEASE_DEFAULT_TTL
-        con.execute("""INSERT INTO leases (resource,holder_slug,device,acquired_ts,ttl_seconds)
-                       VALUES (?,?,?,?,?)""", (a.resource, a.slug, device, now_iso(), ttl))
-        lid = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        lid = _insert_id(
+            con,
+            """INSERT INTO leases (resource,holder_slug,device,acquired_ts,ttl_seconds)
+               VALUES (?,?,?,?,?)""", (a.resource, a.slug, device, now_iso(), ttl))
         _event(con, a.slug, "lease-acquire", a.resource, device)
     print(f"✓ lease #{lid}: {a.resource} → {a.slug}" + (f" (device {device})" if device else "")
           + f", ttl {ttl}s — release the moment you're done: fleet lease release --resource "
