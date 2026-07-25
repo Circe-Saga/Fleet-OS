@@ -16,7 +16,13 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+
+def _iso(offset_seconds: int = 0) -> str:
+    return (datetime.now(timezone.utc)
+            + timedelta(seconds=offset_seconds)).isoformat(timespec="seconds")
 
 HERE = Path(__file__).resolve().parent
 FLEET = HERE.parent / "fleet.py"
@@ -102,9 +108,12 @@ class FleetCase(unittest.TestCase):
                 con.execute(_pg(sql), params)
             return
         con = sqlite3.connect(self.db)
-        con.execute(sql, params)
-        con.commit()
-        con.close()
+        try:
+            con.execute(sql, params)
+            con.commit()
+        finally:
+            con.close()   # close even when the statement raises (e.g. a unique-violation probe),
+            #               else the lingering connection holds the DB lock for the next subprocess
 
     def add_task(self, objective="do the thing", kind="implement", **kw):
         args = ["task", "add", "--objective", objective, "--kind", kind,
@@ -749,6 +758,138 @@ class TestLeases(FleetCase):
     def test_status_with_no_leases_ever(self):
         out = self.fleet("lease", "status").stdout
         self.assertIn("no leases ever recorded", out)
+
+
+class TestMultiHost(FleetCase):
+    """E-A2: two simulated hosts (FLEET_HOST) against one shared DB. host B's harvest/reap must
+    never touch host A's live runs or leases; the lease mutex is DB-enforced; verify defers on a
+    remote worktree; resume is host-pinned. (Under SQLite one shared file IS the shared DB.)"""
+
+    def _run(self, slug, host, pid, heartbeat, status="running", result_ref=None):
+        self.fleet("status")  # ensure schema (runs.host/heartbeat_ts) exists before the raw INSERT
+        self.raw_exec(
+            "INSERT INTO runs (agent_slug,product,status,pid,result_ref,host,heartbeat_ts,"
+            "started_ts) VALUES (?,'claude',?,?,?,?,?,?)",
+            (slug, status, pid, result_ref, host, heartbeat, _iso()))
+
+    def test_harvest_is_host_scoped(self):
+        # host A has a live run; host B has a dead run. host B's harvest touches ONLY its own.
+        self._run("lane-a", "hostA", 999999998, _iso())
+        self._run("lane-b", "hostB", 999999999, _iso())   # dead pid, no result → will fail-harvest
+        self.fleet("harvest", env_extra={"FLEET_HOST": "hostB"})
+        st = {r["agent_slug"]: r["status"] for r in self.q("SELECT agent_slug, status FROM runs")}
+        self.assertEqual(st["lane-a"], "running")   # host A's live run is invisible to host B
+        self.assertEqual(st["lane-b"], "failed")    # host B harvested its own dead run
+
+    def test_reap_spares_live_remote_lease_then_reaps_dead_one(self):
+        # host A holds ios-sim, guarded by a run on host A with a FRESH heartbeat.
+        self._run("lane-a", "hostA", 999999999, _iso())
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
+                   env_extra={"FLEET_HOST": "hostA"})
+        # host B's tick reaper judges the remote holder by heartbeat, not pid → fresh → SPARED.
+        self.fleet("tick", env_extra={"FLEET_HOST": "hostB"})
+        self.assertIsNone(self.q("SELECT released_ts FROM leases")[0]["released_ts"])
+        # heartbeat lapses past the TTL → now host B may reap the abandoned lease.
+        self.raw_exec("UPDATE runs SET heartbeat_ts=? WHERE agent_slug='lane-a'", (_iso(-100000),))
+        out = self.fleet("tick", env_extra={"FLEET_HOST": "hostB"}).stdout
+        self.assertIn("reaped ios-sim", out)
+        self.assertIsNotNone(self.q("SELECT released_ts FROM leases")[0]["released_ts"])
+
+    def test_lease_unique_index_rejects_second_active_row(self):
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a")
+        # The partial unique index (one unreleased row per resource) is the mutex, enforced by the
+        # DB itself — a second active row for the same resource is impossible, backend regardless.
+        err = psycopg.errors.UniqueViolation if USE_PG else sqlite3.IntegrityError
+        with self.assertRaises(err):
+            self.raw_exec("INSERT INTO leases (resource,holder_slug,acquired_ts,ttl_seconds) "
+                          "VALUES ('ios-sim','lane-b',?,1800)", (_iso(),))
+        # released rows do NOT count — the audit trail (many rows per resource) still works.
+        self.fleet("lease", "release", "--resource", "ios-sim", "--as", "lane-a")
+        self.raw_exec("INSERT INTO leases (resource,holder_slug,acquired_ts,ttl_seconds) "
+                      "VALUES ('ios-sim','lane-b',?,1800)", (_iso(),))
+
+    def test_concurrent_acquire_exactly_one_wins(self):
+        self.fleet("status")
+        # Give every candidate a locally-live run (host NULL → judged by pid = this process, which
+        # IS alive), so no acquire can reap another as "stale" — the only way to win is the mutex.
+        for i in range(6):
+            self.raw_exec("INSERT INTO runs (agent_slug,product,status,pid,started_ts) "
+                          "VALUES (?, 'claude','running',?, ?)", (f"lane-{i}", os.getpid(), _iso()))
+        codes = []
+        lock = threading.Lock()
+
+        def acq(i):
+            r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", f"lane-{i}",
+                           expect=None)
+            with lock:
+                codes.append(r.returncode)
+
+        threads = [threading.Thread(target=acq, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(codes.count(0), 1, f"exactly one acquire must win; got {codes}")
+        self.assertEqual(len(self.q("SELECT id FROM leases WHERE released_ts IS NULL")), 1)
+
+    def test_concurrent_set_state_guard_runs_inside_txn(self):
+        # Two overlapping-territory tasks raced to IN_PROGRESS. The territory guard now reads INSIDE
+        # the write transaction, so the two starts serialize and exactly one wins — with the guard
+        # outside the txn (the old shape) both would read "no overlap" and both would start.
+        t1 = self.add_task(objective="a", repo="acme-api", territory="app/x/")
+        t2 = self.add_task(objective="b", repo="acme-api", territory="app/x/")
+        codes = []
+        lock = threading.Lock()
+
+        def start(tid):
+            r = self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                           "--actor", "conductor", expect=None)
+            with lock:
+                codes.append(r.returncode)
+
+        threads = [threading.Thread(target=start, args=(t1,)),
+                   threading.Thread(target=start, args=(t2,))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(codes.count(0), 1, f"exactly one start must win; got {codes}")
+        self.assertEqual(len(self.q("SELECT id FROM tasks WHERE state='IN_PROGRESS'")), 1)
+
+    def test_verify_defers_on_remote_worktree(self):
+        tid = self.add_task(owner="lane-w")
+        wt = self.workspace / ".worktrees" / "lane-w--wt"
+        wt.mkdir(parents=True, exist_ok=True)
+        # Register the worktree AS host A (binds workstreams.host = hostA).
+        self.fleet("set", "--slug", "lane-w", "--worktree", str(wt),
+                   env_extra={"FLEET_HOST": "hostA"})
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
+        # host B: the worktree is a path on another machine — refuse POLITELY (exit 3), not the
+        # exit-2 config hard-error, and name the owning host.
+        r = self.fleet("verify", "--task", str(tid), expect=3, env_extra={"FLEET_HOST": "hostB"})
+        self.assertIn("owned by host hostA", r.stderr)
+        self.assertIn("DEFERRED", r.stderr)
+        # host A runs the very same gate green.
+        self.fleet("verify", "--task", str(tid), env_extra={"FLEET_HOST": "hostA"})
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertTrue(ev.get("verified_by_conductor"))
+
+    def test_resume_is_host_pinned(self):
+        # A session created on host A resumes only on host A; host B is refused (with --fresh the
+        # escape hatch). Registering --session-id binds workstreams.host = the registering host.
+        self.fleet("set", "--slug", "lane-w", "--session-id", "sess-123",
+                   env_extra={"FLEET_HOST": "hostA"})
+        r = self.fleet("run", "--agent", "lane-w", "--input", "hi", expect=2,
+                       env_extra={"FLEET_HOST": "hostB"})
+        self.assertIn("pinned to host hostA", r.stderr)
+        self.assertEqual(self.q("SELECT id FROM runs"), [])  # nothing launched
+
+    def test_events_are_commander_signed(self):
+        # The audit log distinguishes commanders even when both act as the "conductor" role.
+        self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
+                   env_extra={"FLEET_COMMANDER": "alice@hostA"})
+        rows = self.q("SELECT commander FROM events WHERE action='lease-acquire'")
+        self.assertEqual(rows[0]["commander"], "alice@hostA")
 
 
 if __name__ == "__main__":
