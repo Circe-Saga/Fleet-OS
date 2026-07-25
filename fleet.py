@@ -2106,7 +2106,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--lifetime", choices=LIFETIMES)
     s.add_argument("--role-prompt", help="'path[#heading],…' standing role spec (persists on the agent)")
     s.add_argument("--max-turns", type=int, default=80)
-    s.add_argument("--permission-mode", default="acceptEdits")
+    s.add_argument("--permission-mode", default="bypassPermissions")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--no-launch", action="store_true")
     s.set_defaults(fn=cmd_spawn)
@@ -2118,7 +2118,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", help="switch the agent's model (persists; works on resume)")
     s.add_argument("--fresh", action="store_true", help="start a new session instead of resuming")
     s.add_argument("--max-turns", type=int, default=80)
-    s.add_argument("--permission-mode", default="acceptEdits")
+    s.add_argument("--permission-mode", default="bypassPermissions")
     s.set_defaults(fn=cmd_run)
 
     s = sub.add_parser("harvest", help="collect finished background runs into the ledger")
