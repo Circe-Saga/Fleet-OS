@@ -6,7 +6,6 @@ SessionStart hook re-grounds you from them afterwards.
 """
 import json
 import os
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -25,8 +24,12 @@ def main() -> int:
         cwd = Path(payload.get("cwd") or os.getcwd())
         marker = cwd / ".claude" / ".fleet_session_start"
         since = marker.read_text().strip() if marker.exists() else None
-        db = os.environ.get("FLEET_DB", str(FLEET_HOME / "fleet.db"))
-        con = sqlite3.connect(db, timeout=3.0)
+        # Route through fleet's dual-backend connection (FLEET_DB may be a postgres:// DSN).
+        # Any failure below falls through to the fail-open except.
+        if str(FLEET_HOME) not in sys.path:
+            sys.path.insert(0, str(FLEET_HOME))
+        import fleet
+        con = fleet.connect()
         try:
             q = ("SELECT COUNT(*) FROM updates WHERE slug=? AND ts>=?" if since
                  else "SELECT COUNT(*) FROM updates WHERE slug=?")

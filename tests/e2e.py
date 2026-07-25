@@ -37,6 +37,14 @@ PY = sys.executable
 
 CHECK_CMD = 'python3 -c "import greeting; assert greeting.greeting() == \'hello fleet\'"'
 
+# Dual-backend: set FLEET_PG_TEST to a postgres:// DSN to run the golden path against Postgres
+# (its public schema is reset first); otherwise a throwaway SQLite file is used.
+PG_DSN = os.environ.get("FLEET_PG_TEST") or None
+USE_PG = bool(PG_DSN)
+if USE_PG:
+    import psycopg
+    from psycopg.rows import dict_row
+
 
 class E2E:
     def __init__(self, live: bool):
@@ -46,9 +54,14 @@ class E2E:
         self.ws = root / "workspace"
         self.ws.mkdir()
         self.waiting = root / "WAITING_ON_YOU.md"
+        if USE_PG:
+            with psycopg.connect(PG_DSN, autocommit=True) as con:
+                con.execute("DROP SCHEMA IF EXISTS public CASCADE")
+                con.execute("CREATE SCHEMA public")
+        base_env = {k: v for k, v in os.environ.items() if not k.startswith("FLEET_")}
         self.env = {
-            **os.environ,
-            "FLEET_DB": str(root / "fleet.db"),
+            **base_env,
+            "FLEET_DB": PG_DSN if USE_PG else str(root / "fleet.db"),
             "FLEET_WORKSPACE": str(self.ws),
             "FLEET_WORKTREES": str(self.ws / ".worktrees"),
             "FLEET_RUNS_DIR": str(root / "runs"),
@@ -68,6 +81,10 @@ class E2E:
         return r
 
     def q(self, sql, params=()):
+        if USE_PG:
+            sql = sql.replace("%", "%%").replace("?", "%s")
+            with psycopg.connect(PG_DSN, autocommit=True, row_factory=dict_row) as con:
+                return [dict(r) for r in con.execute(sql, params).fetchall()]
         con = sqlite3.connect(self.env["FLEET_DB"])
         con.row_factory = sqlite3.Row
         try:
