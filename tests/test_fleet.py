@@ -293,6 +293,91 @@ class TestMessaging(FleetCase):
         self.assertEqual(len(d["unrouted_messages"]), 0)
 
 
+class TestHierarchy(FleetCase):
+    """E-D: tasks.level + parent_id semantics, tree roll-ups (architecture §2.1, decision D-2)."""
+
+    def _add(self, obj, **kw):
+        kw.setdefault("kind", "doc")
+        return self.add_task(objective=obj, **kw)
+
+    def test_flat_task_default_unchanged(self):
+        """A plain `task add` — no --level, no --parent — is a leaf task with no roll-up."""
+        tid = self.add_task()
+        self.assertEqual(self.q("SELECT level FROM tasks WHERE id=?", (tid,))[0]["level"], "task")
+        d = json.loads(self.fleet("digest", "--json").stdout)
+        t = next(x for x in d["open_tasks"] if x["id"] == tid)
+        self.assertEqual(t["level"], "task")
+        self.assertNotIn("rollup", t)
+
+    def test_parent_must_exist(self):
+        r = self.fleet("task", "add", "--objective", "x", "--kind", "doc", "--done", "d",
+                       "--level", "story", "--parent", "9999", expect=2)
+        self.assertIn("no such task", r.stderr)
+
+    def test_level_ordering_enforced(self):
+        init = self._add("Initiative", level="initiative")
+        epic = self._add("Epic", level="epic", parent=init)  # epic ⊂ initiative — legal
+        self.assertEqual(self.q("SELECT parent_id, level FROM tasks WHERE id=?", (epic,))[0]
+                         ["parent_id"], init)
+        leaf = self.add_task(objective="Leaf")  # a plain task
+        # an epic cannot hang off a task (equal-or-deeper parent)
+        r = self.fleet("task", "add", "--objective", "bad", "--kind", "doc", "--done", "d",
+                       "--level", "epic", "--parent", str(leaf), expect=2)
+        self.assertIn("cannot be parented", r.stderr)
+        # an initiative is a root — it may not take any parent
+        r = self.fleet("task", "add", "--objective", "bad2", "--kind", "doc", "--done", "d",
+                       "--level", "initiative", "--parent", str(init), expect=2)
+        self.assertIn("cannot be parented", r.stderr)
+        # a task may skip levels and sit directly under an initiative (parent strictly shallower)
+        self.fleet("task", "add", "--objective", "ok", "--kind", "doc", "--done", "d",
+                   "--parent", str(init))
+
+    def test_recursive_cte_rollup_counts_by_state(self):
+        """digest --json carries a descendant state tally on every non-task row, three levels deep
+        (initiative→epic→story→task), exercising the recursive-CTE walk past a single hop."""
+        init = self._add("Init", level="initiative")
+        epic = self._add("Epic", level="epic", parent=init)
+        story = self._add("Story", level="story", parent=epic)
+        t1 = self.add_task(objective="t1", parent=story)
+        t2 = self.add_task(objective="t2", parent=story)
+        t3 = self.add_task(objective="t3", parent=story)
+        # states set directly (a fixture) — the roll-up only reads state, not the gate machinery
+        self.raw_exec("UPDATE tasks SET state=? WHERE id=?", ("IN_PROGRESS", t1))
+        self.raw_exec("UPDATE tasks SET state=? WHERE id=?", ("DONE", t2))
+        # t3 stays QUEUED
+        d = json.loads(self.fleet("digest", "--json").stdout)
+        tasks = {t["id"]: t for t in d["open_tasks"]}
+        # story's direct children: one of each state
+        self.assertEqual(tasks[story]["rollup"], {"IN_PROGRESS": 1, "DONE": 1, "QUEUED": 1})
+        # epic rolls up story (QUEUED) + the three grandchildren
+        self.assertEqual(tasks[epic]["rollup"],
+                         {"QUEUED": 2, "IN_PROGRESS": 1, "DONE": 1})
+        # initiative rolls up the whole subtree: epic + story + three tasks
+        self.assertEqual(tasks[init]["rollup"],
+                         {"QUEUED": 3, "IN_PROGRESS": 1, "DONE": 1})
+        # a DONE descendant is counted even though it's filtered out of the open-task list
+        self.assertNotIn(t2, tasks)
+        # leaf rows carry no roll-up
+        self.assertNotIn("rollup", tasks[t1])
+
+    def test_task_list_renders_indented_tree(self):
+        init = self._add("Init", level="initiative")
+        epic = self._add("Epic", level="epic", parent=init)
+        leaf = self.add_task(objective="Leaf", parent=epic)
+        lines = [ln for ln in self.fleet("task", "list").stdout.splitlines() if ln.strip()]
+        idx = {tid: next(i for i, ln in enumerate(lines) if f"#{tid:>3}" in ln)
+               for tid in (init, epic, leaf)}
+        # parent precedes child, and each rung is indented deeper than the last
+        self.assertLess(idx[init], idx[epic])
+        self.assertLess(idx[epic], idx[leaf])
+        lead = lambda i: len(lines[i]) - len(lines[i].lstrip())
+        self.assertLess(lead(idx[init]), lead(idx[epic]))
+        self.assertLess(lead(idx[epic]), lead(idx[leaf]))
+        # non-task rows show a roll-up tag; the initiative's lone descendant chain is 1 epic
+        self.assertIn("[initiative ·", lines[idx[init]])
+        self.assertIn("[epic ·", lines[idx[epic]])
+
+
 class TestDecisions(FleetCase):
     def test_reversible_requires_default(self):
         r = self.fleet("decide", "--question", "flip it?", "--reversible", expect=2)

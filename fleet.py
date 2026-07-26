@@ -71,6 +71,10 @@ STATUS_OUT = Path(os.environ.get("FLEET_STATUS_OUT", str(FLEET_HOME / "STATUS.md
 AGENT_STATES = ("ACTIVE", "BLOCKED", "NEEDS-USER", "PARKED")
 TASK_STATES = ("QUEUED", "IN_PROGRESS", "IN_REVIEW", "BLOCKED", "NEEDS_HUMAN", "DONE", "PARKED")
 TASK_KINDS = ("implement", "review", "test", "deploy", "doc", "investigate", "decide")
+# Work-hierarchy rungs, ordered shallow→deep (architecture §2.1, decision D-2). A row's `level`
+# names its rung; its parent must sit STRICTLY shallower (an epic under an initiative, a task under
+# a story). `_level_rank` maps a level to its depth so cmd_task_add can enforce that ordering.
+TASK_LEVELS = ("initiative", "epic", "story", "task")
 TIERS = ("FYI", "BLOCKER", "PROTOCOL")
 PERSISTENT_TIERS = ("BLOCKER", "PROTOCOL")
 MSG_KINDS = ("fyi", "handoff", "request", "contract-change", "review-finding", "retraction")
@@ -163,6 +167,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("workstreams", "role_prompt", "TEXT"),
     ("runs", "model", "TEXT"),   # which model powered the run (alias; the launch-time truth)
     ("tasks", "kestral_id", "TEXT"),  # idempotency key for the one-way Kestral mirror
+    ("tasks", "level", "TEXT NOT NULL DEFAULT 'task'"),  # hierarchy rung (see TASK_LEVELS)
     ("messages",  "kind",            "TEXT DEFAULT 'fyi'"),
     ("messages",  "requires_action", "INTEGER DEFAULT 0"),
     ("messages",  "supersedes_id",   "INTEGER"),
@@ -956,6 +961,39 @@ def _get_task(con, tid: int, for_update: bool = False):
     return con.execute(sql, (tid,)).fetchone()
 
 
+def _level_rank(level: str | None) -> int:
+    """Depth of a hierarchy level (initiative=0 … task=3). Unknown/NULL falls to 'task' — the same
+    default the schema backfills — so legacy rows and typos never sort ahead of a real parent."""
+    try:
+        return TASK_LEVELS.index(level)
+    except ValueError:
+        return TASK_LEVELS.index("task")
+
+
+def _subtree_rollups(con) -> dict[int, dict[str, int]]:
+    """For every task, a count of its DESCENDANTS by state — the roll-up the digest and tree view
+    hang on non-leaf rows. Computed with a portable recursive CTE (runs identically on SQLite and
+    Postgres): walk parent_id edges down from each node, then aggregate the reached rows by state.
+    The depth bound is a cheap cycle-guard against any legacy parent_id data predating level-order
+    validation. Returns {ancestor_id: {state: count}}; ancestors with no descendants are absent."""
+    rows = con.execute(
+        """WITH RECURSIVE subtree(anc, node, depth) AS (
+               SELECT id, id, 0 FROM tasks
+               UNION ALL
+               SELECT s.anc, t.id, s.depth + 1
+                 FROM tasks t JOIN subtree s ON t.parent_id = s.node
+                WHERE s.depth < 50
+           )
+           SELECT s.anc AS anc, t.state AS state, COUNT(*) AS n
+             FROM subtree s JOIN tasks t ON t.id = s.node
+            WHERE s.node != s.anc
+            GROUP BY s.anc, t.state""").fetchall()
+    out: dict[int, dict[str, int]] = {}
+    for r in rows:
+        out.setdefault(r["anc"], {})[r["state"]] = r["n"]
+    return out
+
+
 def _territories_overlap(t1: str | None, t2: str | None) -> bool:
     """Conservative overlap check on comma-separated path globs: equal, or one prefixes the other
     (dir vs file within it). Globs are compared on their non-wildcard prefix."""
@@ -974,10 +1012,28 @@ def cmd_task_add(con, a) -> int:
     if a.kind not in TASK_KINDS:
         print(f"ERROR: --kind must be one of {TASK_KINDS}", file=sys.stderr)
         return 2
+    level = a.level or "task"
+    if level not in TASK_LEVELS:
+        print(f"ERROR: --level must be one of {TASK_LEVELS}", file=sys.stderr)
+        return 2
     deps = [int(x) for x in a.depends.split(",") if x.strip()] if a.depends else []
     for d in deps:
         if not _get_task(con, d):
             print(f"ERROR: --depends {d}: no such task", file=sys.stderr)
+            return 2
+    if a.parent is not None:
+        # parent_id finally means something (architecture §2.1): the parent must exist and sit
+        # STRICTLY shallower than this row — an epic under an initiative, a task under a story.
+        # Equal-or-deeper (incl. an initiative given any parent) is a structure error, and because
+        # the level rank strictly increases downward this same check makes parent cycles impossible.
+        parent = _get_task(con, a.parent)
+        if not parent:
+            print(f"ERROR: --parent {a.parent}: no such task", file=sys.stderr)
+            return 2
+        if _level_rank(parent["level"]) >= _level_rank(level):
+            allowed = ", ".join(TASK_LEVELS[:_level_rank(level)]) or "none — this is the top level"
+            print(f"ERROR: a {level} cannot be parented to a {parent['level']} "
+                  f"(parent must be a shallower level: {allowed})", file=sys.stderr)
             return 2
     ctx = [{"ptr": p.split("::")[0].strip(), "why": (p.split("::")[1].strip() if "::" in p else "")}
            for p in (a.context or [])]
@@ -986,12 +1042,14 @@ def cmd_task_add(con, a) -> int:
         task_id = _insert_id(
             con,
             """INSERT INTO tasks (objective,kind,state,owner_slug,repo,territory,branch,depends_on,
-                 done_criteria,dont_touch,context_refs,budget_usd,parent_id,created_ts,updated_ts)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 done_criteria,dont_touch,context_refs,budget_usd,parent_id,level,created_ts,updated_ts)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (a.objective, a.kind, "QUEUED", a.owner, a.repo, a.territory, a.branch,
-             json.dumps(deps), a.done, a.dont_touch, json.dumps(ctx), a.budget, a.parent, ts, ts))
+             json.dumps(deps), a.done, a.dont_touch, json.dumps(ctx), a.budget, a.parent, level, ts, ts))
         _event(con, a.actor or "conductor", "task-add", f"task:{task_id}", a.objective)
-    print(f"✓ task #{task_id} [{a.kind}] QUEUED — {a.objective}")
+    tag = "" if level == "task" else f" {level}"
+    parented = f" ⊂#{a.parent}" if a.parent is not None else ""
+    print(f"✓ task #{task_id} [{a.kind}]{tag} QUEUED{parented} — {a.objective}")
     return 0
 
 
@@ -1003,12 +1061,42 @@ def cmd_task_list(con, a) -> int:
         clauses.append("owner_slug=?"); params.append(a.owner)
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = con.execute(f"SELECT * FROM tasks{where} ORDER BY id", params).fetchall()
+    matched = {t["id"] for t in rows}
+    rollups = _subtree_rollups(con)
+    # Render as a tree: index each matching row under its parent, then walk from the roots (rows
+    # whose parent is NULL or falls outside the filtered set) depth-first, so children print
+    # indented beneath their parent and non-leaf rows carry a rolled-up state tally. Flat,
+    # parentless tasks — the common case — print exactly as before, at depth 0 with no tag.
+    by_parent: dict[int | None, list] = {}
     for t in rows:
+        by_parent.setdefault(t["parent_id"] if t["parent_id"] in matched else None, []).append(t)
+
+    def line(t, depth):
         deps = _loads(t["depends_on"], [])
         dep = f"  deps:{deps}" if deps else ""
         spend = f"  ${t['spent_usd']:.2f}" + (f"/${t['budget_usd']:.0f}" if t["budget_usd"] else "")
-        print(f"#{t['id']:>3} [{t['state']:>11}] ({t['kind']}) {t['objective']}  "
-              f"→ {t['owner_slug'] or 'unassigned'} @ {t['repo'] or '-'}{dep}{spend}")
+        roll = ""
+        if t["level"] != "task":
+            rc = rollups.get(t["id"], {})
+            tally = " ".join(f"{s}:{n}" for s, n in sorted(rc.items())) if rc else "empty"
+            roll = f"  [{t['level']} · {tally}]"
+        print(f"{'  ' * depth}#{t['id']:>3} [{t['state']:>11}] ({t['kind']}) {t['objective']}  "
+              f"→ {t['owner_slug'] or 'unassigned'} @ {t['repo'] or '-'}{dep}{spend}{roll}")
+
+    seen: set[int] = set()
+
+    def walk(anchor, depth):
+        for t in by_parent.get(anchor, []):
+            if t["id"] in seen:  # guard a legacy parent cycle from looping
+                continue
+            seen.add(t["id"])
+            line(t, depth)
+            walk(t["id"], depth + 1)
+
+    walk(None, 0)
+    for t in rows:  # any row stranded by a parent cycle still prints, flat
+        if t["id"] not in seen:
+            line(t, 0)
     if not rows:
         print("(no tasks match)")
     return 0
@@ -1866,9 +1954,14 @@ def _digest_data(con) -> dict:
         ag["running_run"] = running.get(ag["slug"])
     tasks = [dict(t) for t in con.execute(
         "SELECT * FROM tasks WHERE state NOT IN ('DONE','PARKED') ORDER BY id").fetchall()]
+    # Roll up each non-leaf row's descendants by state (recursive CTE over the WHOLE table, so a
+    # done child still counts even though it's filtered out of the open-task list below).
+    rollups = _subtree_rollups(con)
     for t in tasks:
         t["depends_on"] = _loads(t["depends_on"], [])
         t["evidence"] = _loads(t["evidence"], {})
+        if t["level"] != "task":
+            t["rollup"] = rollups.get(t["id"], {})
     unrouted = [dict(m) for m in con.execute(
         """SELECT * FROM messages WHERE requires_action=1 AND routed_ts IS NULL
            AND resolved_ts IS NULL ORDER BY ts""").fetchall()
@@ -2253,7 +2346,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--owner"); s.add_argument("--repo"); s.add_argument("--territory")
     s.add_argument("--branch"); s.add_argument("--depends"); s.add_argument("--dont-touch")
     s.add_argument("--context", action="append", help="'<ptr> :: <why>' (repeatable)")
-    s.add_argument("--budget", type=float); s.add_argument("--parent", type=int)
+    s.add_argument("--budget", type=float)
+    s.add_argument("--level", choices=TASK_LEVELS, default="task",
+                   help="hierarchy rung (initiative|epic|story|task); default task")
+    s.add_argument("--parent", type=int,
+                   help="parent task id; parent must be a strictly shallower level (see --level)")
     s.add_argument("--actor")
     s.set_defaults(fn=cmd_task_add)
     s = t.add_parser("list")
