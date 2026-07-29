@@ -1226,7 +1226,8 @@ def cmd_task_set_state(con, a) -> int:
                     if _territories_overlap(t["territory"], o["territory"]):
                         print(f"REFUSED: territory overlaps IN_PROGRESS task #{o['id']} "
                               f"({o['territory'] or 'unscoped'}) in {t['repo']}. Two agents, one "
-                              f"tree = the clip_analysis.py story. Re-scope or wait.",
+                              f"tree is how you get two agents negotiating over one file. "
+                              f"Re-scope or wait.",
                               file=sys.stderr)
                         return 2
         con.execute("UPDATE tasks SET state=?, updated_ts=? WHERE id=?",

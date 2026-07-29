@@ -381,8 +381,9 @@ they're live GitHub facts the Conductor reads at gate time (C2). Transition rule
 
 ## 6. Spawn & territory policy
 
-Spawn a **new** agent only on: (a) territory boundary (different repo/branch/owned paths — the
-`clip_analysis.py` two-agents-one-file negotiations of v1 are the cautionary tale); (b)
+Spawn a **new** agent only on: (a) territory boundary (different repo/branch/owned paths — in v1,
+two agents sharing one tree reliably ended up negotiating over one file, which is the cautionary
+tale); (b)
 independence requirement (review/test must not share the author's context); (c) parallelizable
 work with a clean contract seam; (d) owner context saturation (>~60% budget) with a separable
 subtask. Otherwise route to the territory owner — a fresh spawn re-derives cold context, the
