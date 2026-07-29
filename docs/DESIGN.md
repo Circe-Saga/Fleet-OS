@@ -317,10 +317,11 @@ to the next task immediately.
 `WAITING_ON_YOU.md` (workspace root; mirrored to Kestral one-way). One item = one screen:
 
 ```
-## [taste] Keyframe_v1 rollout — go/no-go?                     expires: never (irreversible)
-Context: flips L1 default; needs re-ingest + gold re-check (clip_moments v2→v3). Built, gated.
-Recommendation: approve re-ingest on the 12-case set first, full set after gold passes.
-If you do nothing: stays opt-in (this one waits for you — irreversible).
+## [taste] Make the new sort order the product default?         expires: never (irreversible)
+Context: +6% task completion in the A/B, but turning it on rewrites every existing user's saved
+view once, and there is no quiet way back. Built, flag-gated, currently off.
+Recommendation: default it on for accounts created from today; leave existing saved views alone.
+If you do nothing: stays off (this one waits for you — irreversible).
 Respond: fleet resolve --id 9 --resolution "…"        (or tell the Conductor in chat)
 ```
 
