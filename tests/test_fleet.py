@@ -809,19 +809,19 @@ class TestLeases(FleetCase):
         self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b")  # now unblocked
 
     def test_device_pin_refuses_mismatch_and_allows_match(self):
-        env = {"FLEET_LEASE_DEVICES": "ios-sim=iPhone17-t111"}
+        env = {"FLEET_LEASE_DEVICES": "ios-sim=iphone-sim-a"}
         r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
                        "--device", "some-other-device", expect=2, env_extra=env)
         self.assertIn("pinned to device", r.stderr)
         self.assertEqual(self.q("SELECT id FROM leases"), [])
         r = self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-a",
-                       "--device", "iPhone17-t111", env_extra=env)
-        self.assertIn("iPhone17-t111", r.stdout)
+                       "--device", "iphone-sim-a", env_extra=env)
+        self.assertIn("iphone-sim-a", r.stdout)
         # omitting --device falls back to the pin, not an unconstrained lease
         self.fleet("lease", "release", "--resource", "ios-sim", "--as", "lane-a", env_extra=env)
         self.fleet("lease", "acquire", "--resource", "ios-sim", "--as", "lane-b", env_extra=env)
         self.assertEqual(self.q("SELECT device FROM leases ORDER BY id DESC LIMIT 1")[0]
-                         ["device"], "iPhone17-t111")
+                         ["device"], "iphone-sim-a")
 
     def test_tick_reaps_stale_lease(self):
         self._insert_run("lane-a", 999999999)

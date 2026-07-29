@@ -113,7 +113,7 @@ SENSITIVE_PATH_HINTS = ("auth", "consent", "privacy", "schema", "contract", "mig
 # Device pinning for shared-resource leases (see `lease`): resource -> the ONE device name a
 # holder may use. A second booted device (simulator/emulator) slows the whole host for every
 # lane sharing it, so `lease acquire` refuses a --device that doesn't match the pin. Configure
-# with FLEET_LEASE_DEVICES="ios-sim=iPhone17-t111,android-emu=Pixel8"; a resource absent from
+# with FLEET_LEASE_DEVICES="ios-sim=iphone-sim-a,android-emu=Pixel8"; a resource absent from
 # this map has no device constraint (device name is free text, or omitted entirely).
 LEASE_DEVICES = dict(
     kv.split("=", 1) for kv in os.environ.get("FLEET_LEASE_DEVICES", "").split(",") if "=" in kv)

@@ -267,7 +267,7 @@ emulator) — a second instance slows the whole host for every lane sharing it. 
 - **Reaping is automatic**: `fleet tick` releases any lease whose holder's headless run no longer
   has a live pid, plus a TTL backstop (`FLEET_LEASE_TTL_SECONDS`, default 1800s) for the case a
   holder's run row is misleading. You don't need to release on a worker's behalf — tick does it.
-- **Device pinning**: set `FLEET_LEASE_DEVICES="ios-sim=iPhone17-t111"` (comma-separated
+- **Device pinning**: set `FLEET_LEASE_DEVICES="ios-sim=iphone-sim-a"` (comma-separated
   `resource=device` pairs) once per fleet. `lease acquire` then refuses any `--device` that
   doesn't match the pin, so a lane cannot boot a second device even by accident.
 - **If a holder won't release and looks alive** (not reaped, not responding): `fleet inspect
