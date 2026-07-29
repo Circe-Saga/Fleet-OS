@@ -2,11 +2,11 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
-Design: `docs/agent-os-design.md` §4.2. This is the piece that retires hand-tended tabs.
+Design: `docs/DESIGN.md` §4.2. This is the piece that retires hand-tended tabs.
 
 ## INSPECT FIRST
 
-- `docs/agent-os-design.md` §4.2 (spawn mechanics, resume semantics, cross-product rule).
+- `docs/DESIGN.md` §4.2 (spawn mechanics, resume semantics, cross-product rule).
 - Memory/gotcha: primary checkouts under `<workspace>/` sit on stale lane branches with other
   agents' WIP — worktrees MUST branch from `origin/main` after a `git fetch`, never from the
   primary tree's HEAD.

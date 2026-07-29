@@ -2,7 +2,7 @@
 
 Class: new-repo-foundation      Repo: `<workspace>/Fleet-OS` (create)
 
-Design: `<workspace>/docs/agent-os-design.md` §4.1, §5, §10.
+Design: `docs/DESIGN.md` §4.1, §5, §10.
 
 ## INSPECT FIRST
 

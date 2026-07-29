@@ -2,7 +2,7 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
-Design: `docs/agent-os-design.md` §4.5, §7 (escalation), §12 (founder experience).
+Design: `docs/DESIGN.md` §4.5, §7 (escalation), §12 (founder experience).
 
 ## INSPECT FIRST
 

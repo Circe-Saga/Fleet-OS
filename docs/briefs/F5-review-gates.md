@@ -2,7 +2,7 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0–F2
 
-Design: `docs/agent-os-design.md` §4.4 (tiers), §5 (transition table).
+Design: `docs/DESIGN.md` §4.4 (tiers), §5 (transition table).
 
 ## INSPECT FIRST
 

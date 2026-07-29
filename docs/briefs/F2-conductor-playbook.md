@@ -2,7 +2,7 @@
 
 Class: doc+cli      Repo: `<workspace>/Fleet-OS`      Depends: F0, F1
 
-Design: `docs/agent-os-design.md` §3 (authority model), §4.3 (tick), §6 (spawn policy), §8.
+Design: `docs/DESIGN.md` §3 (authority model), §4.3 (tick), §6 (spawn policy), §8.
 
 ## INSPECT FIRST
 

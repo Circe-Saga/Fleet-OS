@@ -2,7 +2,7 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
-Design: `docs/agent-os-design.md` C1 + §4.6. Any rule living only as README prose decays; these
+Design: `docs/DESIGN.md` C1 + §4.6. Any rule living only as README prose decays; these
 hooks make brief-reading and checkpointing physics instead of habits.
 
 ## INSPECT FIRST
