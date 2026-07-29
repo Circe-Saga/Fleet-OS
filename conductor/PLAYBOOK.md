@@ -181,8 +181,10 @@ executors. Same substrate, four different conventions:
 1. **Identity = `role_prompt`.** Each role agent carries a standing prompt spec
    (`fleet set --slug head-of-product --role-prompt "path.md#COMMON CONTEXT,path.md#HEAD OF
    PRODUCT"`). It rides the system prompt on every spawn/resume — the role defines who they
-   are; the task brief defines the work. The cabinet's specs point at
-   `acme-docs/docs/leadership/LEADERSHIP_AGENT_PROMPTS.md`; any team can add its own file.
+   are; the task brief defines the work. The reference fleet keeps the whole cabinet in one
+   markdown file with a heading per role plus a shared `COMMON CONTEXT` heading — which is why
+   the spec supports `#heading` extraction. Write your own wherever you keep docs and point
+   `--role-prompt` at it; there is no file this repo expects to exist.
 2. **Doc/judgment tasks gate differently.** `kind=doc|investigate` deliverables (memos,
    charters, audits) have no test_cmd. done_criteria must still be falsifiable ("memo at
    <path>, states the pivot trigger with thresholds, confidence-labeled"). The gate is:

@@ -6,13 +6,18 @@ Design: `docs/DESIGN.md` §4.1, §5, §10.
 
 ## INSPECT FIRST
 
-- `<workspace>/acme-evallab/evals/scripts/fleet.py`
-  - The v1 substrate being ported. Keep verbatim where proven: `connect`/`write_txn` (WAL +
-    BEGIN IMMEDIATE, fleet.py:150-171), `addressed_to` (174), `cmd_brief`/`_brief_data`
-    (339-434, incl. the ✅ ANSWERED show-once delivery), `cmd_checkpoint` (209), `cmd_resolve`
-    un-stick logic (287-321), `cmd_inspect` cursor-preserving read (441).
-- `<workspace>/acme-evallab/docs/FLEET_COORDINATION_DESIGN.md`
-  - §3 writers-address-correctly; §7 concurrency model. Both principles carry over unchanged.
+- The v1 substrate being ported. Keep verbatim where proven: `connect`/`write_txn` (WAL +
+  `BEGIN IMMEDIATE`), `addressed_to`, `cmd_brief`/`_brief_data` (incl. the ✅ ANSWERED
+  show-once delivery), `cmd_checkpoint`, `cmd_resolve` un-stick logic, `cmd_inspect`
+  cursor-preserving read. (This brief predates the port; those functions are now in this
+  repo's `fleet.py` under the same names — read them there.)
+- The two v1 principles that carry over unchanged, in case you are porting your own v1:
+  - **Writers address correctly.** The *writer* of a message names its recipient; readers
+    never scan a global log. A complete inbox is therefore derivable, which is what makes a
+    focused-but-complete brief possible at all.
+  - **Concurrency by write transaction, not by lock discipline.** One SQLite file in WAL mode,
+    every write inside `BEGIN IMMEDIATE`; concurrent writers from separate processes are safe
+    without a daemon.
 
 ## DO NOT CHANGE
 

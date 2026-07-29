@@ -12,8 +12,10 @@ hooks make brief-reading and checkpointing physics instead of habits.
   (so `FLEET_SLUG`, `FLEET_DB` set by `fleet spawn` are visible).
   - SessionStart: stdout is injected as context.
   - Stop: JSON stdout `{"decision":"block","reason":"…"}` forces the agent to continue.
-- `acme-evallab/docs/workstreams/README.md` rules 1+2 and the checkpoint habit — exactly what
-  gets mechanized here.
+- The v1 protocol these hooks mechanize, which until now existed only as written rules agents
+  were asked to remember: read your addressed brief before you act, and leave a checkpoint
+  before you stop. Written-down rules decay (C1); SessionStart and Stop make the same two rules
+  unskippable.
 
 ## DO NOT CHANGE
 

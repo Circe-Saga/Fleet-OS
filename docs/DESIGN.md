@@ -426,20 +426,20 @@ New tiny repo **`<workspace>/Fleet-OS/`** (git init; versioned, unlike the works
 
 ```
 Fleet-OS/
-  fleet.py            # ported from acme-evallab/evals/scripts/fleet.py + v2 deltas
+  fleet.py            # ported from the v1 fleet script + v2 deltas
   fleet.db            # gitignored; THE workspace record
   runs/               # gitignored; captured worker JSON outputs
   profiles/<model>.md # capability notes, curated from DISCOVERIES
   templates/          # starter prompt, worker settings.json (hooks), WAITING_ON_YOU item
   conductor/PLAYBOOK.md  # the Conductor's tick procedure + policies (this doc §4.3–§8 distilled)
-  briefs → ../briefs  # (convention pointer)
+  docs/briefs/        # the implementation briefs this was built from (F0–F5)
 ```
 
-`acme-evallab`'s v1 fleet keeps running as-is during the transition; its DB seeds the workspace
-DB (`fleet seed` already exists and is idempotent). Its agents cut over by pointing
-`FLEET_DB` at the workspace copy; `evals/scripts/fleet.py` becomes a thin shim → retired.
+A v1 fleet keeps running as-is during the transition; its DB seeds the workspace DB
+(`fleet seed` already exists and is idempotent). Its agents cut over by pointing `FLEET_DB` at
+the workspace copy, and the old v1 script becomes a thin shim → retired.
 
-## 11. Rollout — build order (briefs in `briefs/agent-os/`)
+## 11. Rollout — build order (briefs in `docs/briefs/`)
 
 | # | Brief | Delivers | Depends on |
 |---|---|---|---|
