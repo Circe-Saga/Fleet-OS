@@ -22,9 +22,10 @@ The v1 fleet (fleet.py + fleet.db + BOARD/STATUS + DISCOVERIES) proved:
   The BOARD's cross-stream inbox is better than most human teams' handoffs.
 - **P2. Local SQLite + generated projections is the right substrate.** Concurrent-write safety,
   offline, focused-but-complete briefs — all validated in daily use.
-- **P3. Machine-checkable contracts catch what LLM review misses.** `check_contract.py`,
-  `check_render.py`, the blank-frame gate — every serious incident ended with a new machine gate,
-  and that pattern kept working.
+- **P3. Machine-checkable contracts catch what LLM review misses.** A schema-conformance checker
+  on every PR, and an output-validity gate that opens the produced artifact and asserts it is not
+  empty or degenerate — every serious incident ended with a new machine gate of that shape, and
+  the pattern kept working.
 
 What v1 did **not** solve — the founder's actual overhead:
 

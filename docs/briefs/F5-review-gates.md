@@ -7,8 +7,10 @@ Design: `docs/DESIGN.md` §4.4 (tiers), §5 (transition table).
 ## INSPECT FIRST
 
 - Design §4.4 — tier 0 machine gates / tier 1 triggered LLM review / tier 2 founder.
-- The v1 fleet's `check_contract.py` / `check_render.py` pattern — tier 0 exemplars; the postmortem
-  rule ("what machine gate would have caught this") is policy, encoded in the playbook.
+- The tier 0 exemplars worth copying: a schema-conformance checker run on every PR, and an
+  output-validity gate that opens the produced artifact and asserts it is not empty or
+  degenerate. Both are cheap, deterministic, and catch what an LLM reviewer reads past. The
+  postmortem rule ("what machine gate would have caught this") is policy, encoded in the playbook.
 - `gh pr view/diff --json`, `gh run view` — the evidence sources.
 
 ## DO NOT CHANGE
