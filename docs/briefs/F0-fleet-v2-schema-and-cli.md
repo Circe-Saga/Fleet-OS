@@ -17,7 +17,7 @@ Design: `<workspace>/docs/agent-os-design.md` §4.1, §5, §10.
 ## DO NOT CHANGE
 
 - Do not break v1 command signatures (`brief`, `set`, `checkpoint`, `msg`, `decide`, `resolve`,
-  `ack`, `status`, `log`, `inspect`) — EvalLab agents may cut over with muscle memory intact.
+  `ack`, `status`, `log`, `inspect`) — v1 agents may cut over with muscle memory intact.
 - Do not store anything observable from git/GitHub (no PR-state, CI-state, merged columns).
 - Do not put prose in the DB — envelopes, queues, cursors, ledgers only.
 - Do not touch `acme-evallab`'s fleet.py or fleet.db; the workspace fleet is a parallel install.

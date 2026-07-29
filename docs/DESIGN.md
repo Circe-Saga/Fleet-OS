@@ -16,7 +16,7 @@ survives intact; this doc adds the layers above it and promotes the system to wo
 
 ## 1. What v1 proved and what it didn't
 
-The EvalLab fleet (fleet.py + fleet.db + BOARD/STATUS + DISCOVERIES) proved:
+The v1 fleet (fleet.py + fleet.db + BOARD/STATUS + DISCOVERIES) proved:
 
 - **P1. Writers-address-correctly works.** Agents write excellent, correctly addressed handoffs.
   The BOARD's cross-stream inbox is better than most human teams' handoffs.
@@ -77,9 +77,11 @@ Two design commitments follow from failure analysis of v1:
   the DB is shared across machines. No HTTP shim was needed — coordination goes through the shared
   DB directly. Machine-scoped rows (runs, leases, an agent's worktree/session) carry a `host`;
   harvest/reap are host-scoped; the lease mutex is a DB partial-unique index; a run's cross-host
-  liveness is a heartbeat TTL (its pid is meaningless off-box); verify/resume are host-pinned. See
-  migrations/0002_multihost.sql and the multi-host invariants in
-  Saga-Fleet/docs/FLEET-CLOUD-ARCHITECTURE.md §1.2. SQLite (one workstation) stays the default.
+  liveness is a heartbeat TTL (its pid is meaningless off-box); verify/resume are host-pinned. The
+  governing invariant: a machine-scoped fact is written only by the host that owns it and never
+  inferred cross-host from a pid, a worktree path, or a local clock — so anything another host
+  must act on is either in the DB or does not exist. See migrations/0002_multihost.sql. SQLite
+  (one workstation) stays the default.
 
 ---
 
@@ -297,7 +299,7 @@ Cadence: manual at first (the founder typing "tick" is the correct MVP of a daem
 
 - **Tier 0 (always, free):** CI, contract/schema checkers, tests. Growing this tier is the
   highest-ROI review investment; every incident postmortem asks "what machine gate would have
-  caught this" (the EvalLab fleet already lives this — generalize it per repo).
+  caught this" (the v1 fleet already lives this — generalize it per repo).
 - **Tier 1 (LLM review, triggered):** auto-created `review` task when a PR is prod-facing,
   touches a locked contract/schema_id, touches auth/privacy/consent, exceeds ~300 changed
   lines, or the author self-flags. Reviewer = a *different* agent, gets diff + contract +
@@ -432,8 +434,8 @@ Fleet-OS/
   briefs → ../briefs  # (convention pointer)
 ```
 
-EvalLab's fleet keeps running as-is during the transition; its DB seeds the workspace DB
-(`fleet seed` already exists and is idempotent). EvalLab's agents cut over by pointing
+`acme-evallab`'s v1 fleet keeps running as-is during the transition; its DB seeds the workspace
+DB (`fleet seed` already exists and is idempotent). Its agents cut over by pointing
 `FLEET_DB` at the workspace copy; `evals/scripts/fleet.py` becomes a thin shim → retired.
 
 ## 11. Rollout — build order (briefs in `briefs/agent-os/`)
@@ -477,5 +479,5 @@ there.
   radius = the worktree + branch); prod-deploy tasks stay gated. Decide per task kind.
 - O3. Subscription vs API billing for headless workers — affects ledger semantics
   (`total_cost_usd` is still reported; treat as accounting signal either way).
-- O4. When EvalLab's specialized fleet (stage agents) merges into the workspace fleet vs stays
+- O4. When `acme-evallab`'s specialized v1 fleet (stage agents) merges into the workspace fleet vs stays
   a federated island with its own DB. Leaning: federate until the workspace fleet is proven.
