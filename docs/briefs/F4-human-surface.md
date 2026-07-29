@@ -2,14 +2,16 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0
 
-Design: `docs/agent-os-design.md` §4.5, §7 (escalation), §12 (founder experience).
+Design: `docs/DESIGN.md` §4.5, §7 (escalation), §12 (founder experience).
 
 ## INSPECT FIRST
 
 - Design §4.5 — the one-screen item format (category, context, recommendation, "if you do
   nothing", respond hint).
-- v1 `fleet status` "🔔 WAITING ON YOU" lane + `_build_md` (fleet.py:493-588) — the projection
-  pattern to extend, not replace.
+- v1 `fleet status`'s "WAITING ON YOU" lane and the markdown projection it rendered — the
+  projection pattern to extend, not replace. (This brief predates the port; in this repo the
+  equivalents are `cmd_status`, whose lane is now "🔔 WAITING ON HUMAN", and `cmd_render_waiting`,
+  which writes `WAITING_ON_YOU.md` — read them there.)
 
 ## DO NOT CHANGE
 

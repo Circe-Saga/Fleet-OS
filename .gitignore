@@ -7,3 +7,8 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+
+# Local Claude Code wiring: settings.json holds absolute paths to this checkout
+# (copy templates/worker-settings.json and substitute FLEET_HOME), and
+# .fleet_session_start is runtime state written by the SessionStart hook.
+.claude/

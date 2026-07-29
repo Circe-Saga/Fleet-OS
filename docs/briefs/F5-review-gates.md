@@ -2,13 +2,15 @@
 
 Class: additive      Repo: `<workspace>/Fleet-OS`      Depends: F0–F2
 
-Design: `docs/agent-os-design.md` §4.4 (tiers), §5 (transition table).
+Design: `docs/DESIGN.md` §4.4 (tiers), §5 (transition table).
 
 ## INSPECT FIRST
 
 - Design §4.4 — tier 0 machine gates / tier 1 triggered LLM review / tier 2 founder.
-- EvalLab's `check_contract.py` / `check_render.py` pattern — tier 0 exemplars; the postmortem
-  rule ("what machine gate would have caught this") is policy, encoded in the playbook.
+- The tier 0 exemplars worth copying: a schema-conformance checker run on every PR, and an
+  output-validity gate that opens the produced artifact and asserts it is not empty or
+  degenerate. Both are cheap, deterministic, and catch what an LLM reviewer reads past. The
+  postmortem rule ("what machine gate would have caught this") is policy, encoded in the playbook.
 - `gh pr view/diff --json`, `gh run view` — the evidence sources.
 
 ## DO NOT CHANGE
@@ -21,7 +23,8 @@ Design: `docs/agent-os-design.md` §4.4 (tiers), §5 (transition table).
 
 1. `fleet review-policy --task N [--diff-stat "files,+lines,-lines"]` — pure function → JSON
    verdict `{tier1_required: bool, triggers: [...]}`. Triggers: task.kind==deploy or
-   prod-facing repo (FastAPI/AIEditor/MediaProcessing/CDK/WebApp mainline), territory matches
+   prod-facing repo (the configured `FLEET_PROD_REPOS` mainline set — e.g.
+   `acme-api,acme-editor,acme-web`), territory matches
    locked contracts/schemas or auth/privacy/consent paths, diff > 300 lines, author self-flag
    (`evidence.review_requested`).
 2. Playbook amendment (F2): when a gate request arrives and policy says tier1_required →
@@ -35,7 +38,7 @@ Design: `docs/agent-os-design.md` §4.4 (tiers), §5 (transition table).
 
 ## TESTS / CONTRACTS
 
-review-policy: prod repo → required; EvalLab scratch script 40 lines → not required; 500-line
+review-policy: prod repo → required; `acme-evallab` scratch script 40 lines → not required; 500-line
 eval diff → required (size trigger); self-flag → required. Gate integration: DONE refused
 while a depends-on review task is not DONE (uses F0's transition gate + depends_on).
 

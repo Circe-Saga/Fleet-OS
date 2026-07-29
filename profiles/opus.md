@@ -7,5 +7,5 @@
 - Rejects `temperature` on Bedrock Converse (400) — never pass it.
 - In agentic tool loops on editorial tasks, MORE agency hurt quality (tool_loop 77.8 vs
   single-shot 96.6 on chapter editing) — prefer single-shot with complete context.
-- Bedrock inference-profile grants are REGION-SCOPED (us-west-2 for prod) — escalation calls
-  must originate in the granted region.
+- Bedrock inference-profile grants are REGION-SCOPED — an escalation call must originate in the
+  same region the grant was issued for, or it fails regardless of the model id.

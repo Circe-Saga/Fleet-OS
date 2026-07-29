@@ -2,15 +2,17 @@
 
 Class: doc+cli      Repo: `<workspace>/Fleet-OS`      Depends: F0, F1
 
-Design: `docs/agent-os-design.md` §3 (authority model), §4.3 (tick), §6 (spawn policy), §8.
+Design: `docs/DESIGN.md` §3 (authority model), §4.3 (tick), §6 (spawn policy), §8.
 
 ## INSPECT FIRST
 
 - Design §4.3 — the 7-step tick. Steps 1 (gather), 2-mechanical (stale/cycle/expiry), 6-partial
   (render queue) are deterministic → `fleet tick`. Steps 2-judgment, 3 (route), 4 (drive),
   5 (gate) are LLM judgment → the playbook.
-- `acme-evallab/docs/workstreams/README.md` "review loop" — the human↔coordinator↔agent loop
-  v2 automates; the Conductor inherits the coordinator role with `inspect` (cursor-preserving).
+- The v1 "review loop" this automates: agent posts a stopping point → a human coordinator reads
+  it, decides who needs it, and hand-carries it to the next agent → that agent resumes. The
+  Conductor inherits the coordinator role, and `inspect` (cursor-preserving) is what lets it
+  re-read a stream without consuming the unread markers the agents depend on.
 
 ## DO NOT CHANGE
 

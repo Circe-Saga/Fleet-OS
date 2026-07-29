@@ -16,15 +16,16 @@ survives intact; this doc adds the layers above it and promotes the system to wo
 
 ## 1. What v1 proved and what it didn't
 
-The EvalLab fleet (fleet.py + fleet.db + BOARD/STATUS + DISCOVERIES) proved:
+The v1 fleet (fleet.py + fleet.db + BOARD/STATUS + DISCOVERIES) proved:
 
 - **P1. Writers-address-correctly works.** Agents write excellent, correctly addressed handoffs.
   The BOARD's cross-stream inbox is better than most human teams' handoffs.
 - **P2. Local SQLite + generated projections is the right substrate.** Concurrent-write safety,
   offline, focused-but-complete briefs — all validated in daily use.
-- **P3. Machine-checkable contracts catch what LLM review misses.** `check_contract.py`,
-  `check_render.py`, the blank-frame gate — every serious incident ended with a new machine gate,
-  and that pattern kept working.
+- **P3. Machine-checkable contracts catch what LLM review misses.** A schema-conformance checker
+  on every PR, and an output-validity gate that opens the produced artifact and asserts it is not
+  empty or degenerate — every serious incident ended with a new machine gate of that shape, and
+  the pattern kept working.
 
 What v1 did **not** solve — the founder's actual overhead:
 
@@ -77,9 +78,11 @@ Two design commitments follow from failure analysis of v1:
   the DB is shared across machines. No HTTP shim was needed — coordination goes through the shared
   DB directly. Machine-scoped rows (runs, leases, an agent's worktree/session) carry a `host`;
   harvest/reap are host-scoped; the lease mutex is a DB partial-unique index; a run's cross-host
-  liveness is a heartbeat TTL (its pid is meaningless off-box); verify/resume are host-pinned. See
-  migrations/0002_multihost.sql and the multi-host invariants in
-  Saga-Fleet/docs/FLEET-CLOUD-ARCHITECTURE.md §1.2. SQLite (one workstation) stays the default.
+  liveness is a heartbeat TTL (its pid is meaningless off-box); verify/resume are host-pinned. The
+  governing invariant: a machine-scoped fact is written only by the host that owns it and never
+  inferred cross-host from a pid, a worktree path, or a local clock — so anything another host
+  must act on is either in the DB or does not exist. See migrations/0002_multihost.sql. SQLite
+  (one workstation) stays the default.
 
 ---
 
@@ -297,7 +300,7 @@ Cadence: manual at first (the founder typing "tick" is the correct MVP of a daem
 
 - **Tier 0 (always, free):** CI, contract/schema checkers, tests. Growing this tier is the
   highest-ROI review investment; every incident postmortem asks "what machine gate would have
-  caught this" (the EvalLab fleet already lives this — generalize it per repo).
+  caught this" (the v1 fleet already lives this — generalize it per repo).
 - **Tier 1 (LLM review, triggered):** auto-created `review` task when a PR is prod-facing,
   touches a locked contract/schema_id, touches auth/privacy/consent, exceeds ~300 changed
   lines, or the author self-flags. Reviewer = a *different* agent, gets diff + contract +
@@ -315,10 +318,11 @@ to the next task immediately.
 `WAITING_ON_YOU.md` (workspace root; mirrored to Kestral one-way). One item = one screen:
 
 ```
-## [taste] Keyframe_v1 rollout — go/no-go?                     expires: never (irreversible)
-Context: flips L1 default; needs re-ingest + gold re-check (clip_moments v2→v3). Built, gated.
-Recommendation: approve re-ingest on the 12-case set first, full set after gold passes.
-If you do nothing: stays opt-in (this one waits for you — irreversible).
+## [taste] Make the new sort order the product default?         expires: never (irreversible)
+Context: +6% task completion in the A/B, but turning it on rewrites every existing user's saved
+view once, and there is no quiet way back. Built, flag-gated, currently off.
+Recommendation: default it on for accounts created from today; leave existing saved views alone.
+If you do nothing: stays off (this one waits for you — irreversible).
 Respond: fleet resolve --id 9 --resolution "…"        (or tell the Conductor in chat)
 ```
 
@@ -379,8 +383,9 @@ they're live GitHub facts the Conductor reads at gate time (C2). Transition rule
 
 ## 6. Spawn & territory policy
 
-Spawn a **new** agent only on: (a) territory boundary (different repo/branch/owned paths — the
-`clip_analysis.py` two-agents-one-file negotiations of v1 are the cautionary tale); (b)
+Spawn a **new** agent only on: (a) territory boundary (different repo/branch/owned paths — in v1,
+two agents sharing one tree reliably ended up negotiating over one file, which is the cautionary
+tale); (b)
 independence requirement (review/test must not share the author's context); (c) parallelizable
 work with a clean contract seam; (d) owner context saturation (>~60% budget) with a separable
 subtask. Otherwise route to the territory owner — a fresh spawn re-derives cold context, the
@@ -423,20 +428,20 @@ New tiny repo **`<workspace>/Fleet-OS/`** (git init; versioned, unlike the works
 
 ```
 Fleet-OS/
-  fleet.py            # ported from acme-evallab/evals/scripts/fleet.py + v2 deltas
+  fleet.py            # ported from the v1 fleet script + v2 deltas
   fleet.db            # gitignored; THE workspace record
   runs/               # gitignored; captured worker JSON outputs
   profiles/<model>.md # capability notes, curated from DISCOVERIES
   templates/          # starter prompt, worker settings.json (hooks), WAITING_ON_YOU item
   conductor/PLAYBOOK.md  # the Conductor's tick procedure + policies (this doc §4.3–§8 distilled)
-  briefs → ../briefs  # (convention pointer)
+  docs/briefs/        # the implementation briefs this was built from (F0–F5)
 ```
 
-EvalLab's fleet keeps running as-is during the transition; its DB seeds the workspace DB
-(`fleet seed` already exists and is idempotent). EvalLab's agents cut over by pointing
-`FLEET_DB` at the workspace copy; `evals/scripts/fleet.py` becomes a thin shim → retired.
+A v1 fleet keeps running as-is during the transition; its DB seeds the workspace DB
+(`fleet seed` already exists and is idempotent). Its agents cut over by pointing `FLEET_DB` at
+the workspace copy, and the old v1 script becomes a thin shim → retired.
 
-## 11. Rollout — build order (briefs in `briefs/agent-os/`)
+## 11. Rollout — build order (briefs in `docs/briefs/`)
 
 | # | Brief | Delivers | Depends on |
 |---|---|---|---|
@@ -477,5 +482,5 @@ there.
   radius = the worktree + branch); prod-deploy tasks stay gated. Decide per task kind.
 - O3. Subscription vs API billing for headless workers — affects ledger semantics
   (`total_cost_usd` is still reported; treat as accounting signal either way).
-- O4. When EvalLab's specialized fleet (stage agents) merges into the workspace fleet vs stays
+- O4. When `acme-evallab`'s specialized v1 fleet (stage agents) merges into the workspace fleet vs stays
   a federated island with its own DB. Leaning: federate until the workspace fleet is proven.

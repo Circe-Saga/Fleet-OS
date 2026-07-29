@@ -85,7 +85,7 @@ workers never touch it and its downtime never blocks anything (PLAYBOOK §5b).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 36 unit/integration tests (fake launcher, tmp DBs)
+python3 -m unittest discover -s tests -v   # 71 unit/integration tests (fake launcher, tmp DBs)
 python3 tests/e2e.py                       # full golden-path e2e, simulated worker (free, CI-safe)
 python3 tests/e2e.py --live                # same path with a REAL headless claude worker (~$0.20)
 ```
@@ -101,3 +101,7 @@ The schema upgrades a v1 `fleet.db` in place on first connect (idempotent column
 To adopt: copy the old DB here (SQLite `.backup`, never raw `cp` of a live WAL db), or point
 `FLEET_DB` at it. A v1 `fleet.py` keeps working against its own DB until cutover; both
 understand the same core tables.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
