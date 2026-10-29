@@ -21,6 +21,8 @@ runs/                     # captured worker result JSON (gitignored)
 hooks/                    # SessionStart brief-inject · Stop checkpoint-guard · PreCompact reminder
 templates/worker-settings.json   # hook wiring stamped into each worker worktree by `spawn`
 profiles/<model>.md       # model gotchas, curated from DISCOVERIES → injected into starters
+docs/grok-worker.md       # external webhook contract (fleet dispatch / fleet ingest)
+examples/                 # pilot dispatch contract + result JSON
 conductor/PLAYBOOK.md     # the Conductor's tick procedure
 conductor/worker-rules.md # generic worker rules (finish protocol · shared-resource gate)
 tests/                    # unittest suite (fake launcher; scratch git repos; tmp DB)
@@ -85,7 +87,7 @@ workers never touch it and its downtime never blocks anything (PLAYBOOK §5b).
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests -v   # 71 unit/integration tests (fake launcher, tmp DBs)
+python3 -m unittest discover -s tests -v   # 82 unit/integration tests (fake launcher, tmp DBs)
 python3 tests/e2e.py                       # full golden-path e2e, simulated worker (free, CI-safe)
 python3 tests/e2e.py --live                # same path with a REAL headless claude worker (~$0.20)
 ```

@@ -24,6 +24,8 @@ Conductor surface:
     fleet tick                          # mechanical half of the tick; prints the judgment queue
     fleet digest --json                 # the one-call gather
     fleet spawn --task N | fleet run --agent <slug> --input … | fleet harvest
+    fleet dispatch --task N             # POST an investigate task to the Grok webhook
+    fleet ingest --run N --token … --file result.json   # external result; does not set task state
     fleet verify --task N               # re-run claimed evidence; gate on VERIFIED, not claimed
     fleet task set-state --id N --state IN_REVIEW --actor conductor
     fleet render-waiting                # regenerate the founder queue (WAITING_ON_YOU.md)
@@ -31,15 +33,21 @@ Conductor surface:
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import signal
 import socket
 import sqlite3
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 
 # psycopg (v3) is only needed when FLEET_DB is a postgres:// DSN. Keep it a soft dependency so
@@ -1706,9 +1714,15 @@ def _run_alive(run) -> bool:
     """Is this run still alive, judged correctly across hosts? A LOCAL run (this host, or a
     legacy NULL-host row that can only be ours) gets the authoritative pid check. A REMOTE run's
     pid is meaningless here — judge it by heartbeat freshness instead. This is what keeps host B
-    from ever declaring host A's live run dead (and reaping the lease it guards)."""
+    from ever declaring host A's live run dead (and reaping the lease it guards).
+
+    An external dispatch has no pid on purpose. While await_external is set and the row is still
+    the one handed to _run_alive, the callback is outstanding — a missing pid is not death.
+    Harvest never reaches this for those rows; it skips them first and names the wait."""
     if run is None:
         return False
+    if _await_external(run):
+        return True
     host = _run_host(run)
     if host is None or host == _this_host():
         return _pid_alive(run["pid"])
@@ -1750,6 +1764,18 @@ def cmd_harvest(con, a) -> int:
         return 0
     n_done = 0
     for r in rows:
+        # A webhook dispatch has no pid. A dead pid is not failure while the callback is
+        # outstanding — closing it here would mark every Grok run failed on the next tick.
+        # Age is reported only; the 12h stale-task signal (digest / tick) is the expiry.
+        if _await_external(r):
+            started = _parse(r["started_ts"])
+            aged = bool(started and (datetime.now(timezone.utc) - started)
+                        > timedelta(hours=STALE_TASK_HOURS))
+            note = "awaiting external callback"
+            if aged:
+                note += f" (>{STALE_TASK_HOURS}h — stale-task signal, run left open)"
+            print(f"  ⏳ run #{r['id']} {r['agent_slug']} {note}")
+            continue
         if _run_alive(r):
             print(f"  ⏳ run #{r['id']} {r['agent_slug']} still running (pid {r['pid']})")
             continue
@@ -1808,6 +1834,400 @@ def cmd_retire(con, a) -> int:
     return 0
 
 
+# ── external workers (webhook dispatch + ingest; no listener, no task-state changes) ───────
+# runs.product cannot grow a third value without rebuilding the CHECK, so a Grok run is recorded
+# as product=claude, model=grok. Spend reports group by model. The callback token is hashed at
+# rest; the webhook bearer stays in the environment and is never written to the contract or the DB.
+
+_RESULT_MAX_BYTES = 256 * 1024
+_EXTERNAL_RESULT_KEYS = ("status", "artifact_links", "evidence", "blockers", "cost_usd", "external_ref")
+_RESULT_STATUSES = ("completed", "blocked", "failed")
+_ARTIFACT_TYPES = ("git", "url", "email")
+_BLOCKER_NEEDS = ("conductor", "founder")
+
+
+def _await_external(row) -> bool:
+    if row is None:
+        return False
+    try:
+        keys = row.keys()
+    except AttributeError:
+        return False
+    if "await_external" not in keys:
+        return False
+    return bool(row["await_external"])
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _callback_token_ok(token: str, stored: str | None) -> bool:
+    """Constant-time check of a caller token against the stored SHA-256 hex digest.
+
+    A missing or wrong-length digest still runs compare_digest against a stand-in, so the
+    reject path does not return early on the shape of the stored hash."""
+    if not isinstance(token, str) or not token or len(token) > 512:
+        digest = _token_hash("")
+    else:
+        digest = _token_hash(token)
+    expected = stored if isinstance(stored, str) and len(stored) == len(digest) else _token_hash("")
+    return bool(stored) and hmac.compare_digest(digest, expected)
+
+
+def _nonneg_number(n) -> bool:
+    if isinstance(n, bool) or not isinstance(n, (int, float)):
+        return False
+    if n != n or n == float("inf") or n == float("-inf"):
+        return False
+    return n >= 0
+
+
+def _exact_keys(obj, allowed: set[str], what: str) -> str | None:
+    if not isinstance(obj, dict):
+        return f"{what} must be an object"
+    extra = set(obj) - allowed
+    missing = allowed - set(obj)
+    if extra:
+        return f"{what} has unknown keys: {', '.join(sorted(extra))}"
+    if missing:
+        return f"{what} is missing keys: {', '.join(sorted(missing))}"
+    return None
+
+
+def _validate_external_result(obj) -> str | None:
+    """Return an error string, or None when `obj` is a strict external-worker result.
+
+    Every key is required. Unknown keys are rejected at every level so a `state` or `DONE`
+    field cannot sneak in and be mistaken for a task transition."""
+    err = _exact_keys(obj, set(_EXTERNAL_RESULT_KEYS), "result")
+    if err:
+        return err
+    if obj["status"] not in _RESULT_STATUSES:
+        return "status must be completed, blocked, or failed"
+    links = obj["artifact_links"]
+    if not isinstance(links, list) or len(links) > 20:
+        return "artifact_links must be an array of at most 20 items"
+    for i, link in enumerate(links):
+        err = _exact_keys(link, {"type", "ref"}, f"artifact_links[{i}]")
+        if err:
+            return err
+        if link["type"] not in _ARTIFACT_TYPES:
+            return f"artifact_links[{i}].type must be git, url, or email"
+        if not isinstance(link["ref"], str) or not link["ref"].strip() or len(link["ref"]) > 2000:
+            return f"artifact_links[{i}].ref must be a non-empty string"
+    err = _exact_keys(obj["evidence"], {"claim", "test_cmd"}, "evidence")
+    if err:
+        return err
+    claim, cmd = obj["evidence"]["claim"], obj["evidence"]["test_cmd"]
+    if not isinstance(claim, str) or len(claim) > 8000:
+        return "evidence.claim must be a string"
+    if not isinstance(cmd, str) or len(cmd) > 4000:
+        return "evidence.test_cmd must be a string"
+    if obj["status"] == "completed" and not cmd.strip():
+        return "evidence.test_cmd must be non-empty when status is completed"
+    blockers = obj["blockers"]
+    if not isinstance(blockers, list) or len(blockers) > 20:
+        return "blockers must be an array of at most 20 items"
+    for i, b in enumerate(blockers):
+        err = _exact_keys(b, {"summary", "needs"}, f"blockers[{i}]")
+        if err:
+            return err
+        if not isinstance(b["summary"], str) or not b["summary"].strip() or len(b["summary"]) > 2000:
+            return f"blockers[{i}].summary must be a non-empty string"
+        if b["needs"] not in _BLOCKER_NEEDS:
+            return f"blockers[{i}].needs must be conductor or founder"
+    if not _nonneg_number(obj["cost_usd"]):
+        return "cost_usd must be a number >= 0"
+    ref = obj["external_ref"]
+    if not isinstance(ref, str) or not ref.strip() or len(ref) > 200:
+        return "external_ref must be a non-empty string of at most 200 characters"
+    return None
+
+
+def _webhook_url_error(url: str) -> str | None:
+    p = urllib.parse.urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return "FLEET_GROK_WEBHOOK_URL must be an absolute http(s) URL"
+    if p.username or p.password:
+        return "put the bearer in FLEET_GROK_WEBHOOK_TOKEN, not the webhook URL"
+    return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects. Following one would replay the bearer at a different host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _redact(text: str, *secrets_vals: str) -> str:
+    for s in secrets_vals:
+        if s:
+            text = text.replace(s, "[redacted]")
+    return text
+
+
+def _post_contract(url: str, payload: dict, bearer: str, timeout: float = 30.0) -> None:
+    """POST JSON with the bearer. No redirects, no proxy (the proxy env would send the bearer off-box)."""
+    data = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={
+            "Authorization": f"Bearer {bearer}",
+            "Content-Type": "application/json",
+            "User-Agent": "fleet-os-dispatch",
+        })
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
+        resp.read()
+
+
+def _contract_leak(raw: str, bearer: str) -> str | None:
+    """The contract is task fields plus a callback token. Refuse if a fleet secret landed in it."""
+    db = os.environ.get("FLEET_DB", "")
+    needles = (
+        ("FLEET_GROK_WEBHOOK_TOKEN", bearer),
+        ("FLEET_DB", db),
+        ("FLEET_DB", "FLEET_DB"),
+        ("FLEET_GROK_WEBHOOK_TOKEN", "FLEET_GROK_WEBHOOK_TOKEN"),
+        ("FLEET_GROK_WEBHOOK_URL", os.environ.get("FLEET_GROK_WEBHOOK_URL", "")),
+        ("FLEET_GROK_WEBHOOK_URL", "FLEET_GROK_WEBHOOK_URL"),
+    )
+    for name, needle in needles:
+        if needle and needle in raw:
+            return name
+    return None
+
+
+def _external_contract(t, run_id: int, token: str, nonce: str) -> dict:
+    return {
+        "task_id": t["id"],
+        "run_id": run_id,
+        "objective": t["objective"],
+        "kind": t["kind"],
+        "done_criteria": t["done_criteria"],
+        "dont_touch": t["dont_touch"] or None,
+        "context_refs": _loads(t["context_refs"], []),
+        "budget_usd": t["budget_usd"],
+        "callback_token": token,
+        "nonce": nonce,
+    }
+
+
+def _fail_external_run(con, run_id: int, task_id: int, detail: str) -> None:
+    with write_txn(con):
+        con.execute("UPDATE runs SET status='failed', ended_ts=? WHERE id=? AND status='running'",
+                    (now_iso(), run_id))
+        _event(con, "conductor", "dispatch-fail", f"task:{task_id}", detail)
+
+
+def cmd_dispatch(con, a) -> int:
+    """POST an investigate task to the Grok webhook. Does not change task state or launch a CLI."""
+    t = _get_task(con, a.task)
+    if not t:
+        print(f"ERROR: no task #{a.task}", file=sys.stderr)
+        return 2
+    if t["kind"] != "investigate":
+        print("REFUSED: dispatch is only for kind=investigate.", file=sys.stderr)
+        return 2
+    if (t["repo"] or "").strip() or (t["territory"] or "").strip():
+        print("REFUSED: dispatch refuses a repo or a territory (no repo writes). "
+              "Leave both empty; context_refs are pointers, not a checkout.", file=sys.stderr)
+        return 2
+    url = os.environ.get("FLEET_GROK_WEBHOOK_URL", "").strip()
+    bearer = os.environ.get("FLEET_GROK_WEBHOOK_TOKEN", "").strip()
+    if not url or not bearer:
+        print("ERROR: set FLEET_GROK_WEBHOOK_URL and FLEET_GROK_WEBHOOK_TOKEN in the environment.",
+              file=sys.stderr)
+        return 2
+    url_err = _webhook_url_error(url)
+    if url_err:
+        print(f"ERROR: {url_err}", file=sys.stderr)
+        return 2
+    slug = t["owner_slug"] or f"grok-t{t['id']}"
+    token = secrets.token_urlsafe(32)
+    token_hash = _token_hash(token)
+    nonce = secrets.token_hex(16)
+    with write_txn(con):
+        _serialize_on(con, f"external-task:{t['id']}")
+        open_run = con.execute(
+            "SELECT id, agent_slug FROM runs WHERE status='running' AND (task_id=? OR agent_slug=?)",
+            (t["id"], slug)).fetchone()
+        if open_run:
+            print(f"REFUSED: run #{open_run['id']} is already running for "
+                  f"{open_run['agent_slug']} (ingest or retire it before dispatching again)",
+                  file=sys.stderr)
+            return 2
+        if not con.execute("SELECT slug FROM workstreams WHERE slug=?", (slug,)).fetchone():
+            con.execute(
+                """INSERT INTO workstreams (slug,state,status_line,product,model,lifetime,host,updated_ts)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (slug, "ACTIVE", f"dispatched task #{t['id']}", "claude", "grok", "ephemeral",
+                 _this_host(), now_iso()))
+        if not t["owner_slug"]:
+            con.execute("UPDATE tasks SET owner_slug=?, updated_ts=? WHERE id=?",
+                        (slug, now_iso(), t["id"]))
+        # product stays 'claude': the CHECK cannot grow a value in a nullable-column migration.
+        run_id = _insert_id(
+            con,
+            """INSERT INTO runs (agent_slug,task_id,product,model,status,pid,result_ref,
+                 host,heartbeat_ts,started_ts,await_external,callback_token_hash)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (slug, t["id"], "claude", "grok", "running", None, None,
+             _this_host(), now_iso(), now_iso(), 1, token_hash))
+    contract = _external_contract(t, run_id, token, nonce)
+    raw = json.dumps(contract, ensure_ascii=False, sort_keys=True)
+    leak = _contract_leak(raw, bearer)
+    if leak:
+        _fail_external_run(con, run_id, t["id"], f"contract would contain {leak}")
+        print(f"REFUSED: the contract would contain {leak}. Nothing was sent. "
+              f"Remove it from the task text and dispatch again.", file=sys.stderr)
+        return 2
+    try:
+        _post_contract(url, contract, bearer)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        _fail_external_run(con, run_id, t["id"], "webhook POST failed")
+        print(f"ERROR: webhook POST failed: {_redact(str(exc), bearer, url)}", file=sys.stderr)
+        return 1
+    with write_txn(con):
+        _event(con, "conductor", "dispatch", f"task:{t['id']}", f"run:{run_id} model:grok")
+    print(f"✓ dispatched task #{t['id']} as run #{run_id} ({slug}, model grok)")
+    print(f"callback_token: {token}")
+    return 0
+
+
+def _store_external_result(run_id: int, obj: dict) -> Path:
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = RUNS_DIR / f"grok-run-{run_id}.json"
+    dest.write_text(json.dumps(obj, indent=2, ensure_ascii=False) + "\n")
+    return dest
+
+
+def cmd_ingest(con, a) -> int:
+    """Record one external result. Closes the run and merges evidence. Never changes task state."""
+    row = con.execute("SELECT * FROM runs WHERE id=?", (a.run_id,)).fetchone()
+    if not row:
+        print(f"ERROR: no run #{a.run_id}", file=sys.stderr)
+        return 2
+    stored_hash = row["callback_token_hash"] if "callback_token_hash" in row.keys() else None
+    if not _callback_token_ok(a.token, stored_hash):
+        print(f"REFUSED: callback token does not match run #{a.run_id}", file=sys.stderr)
+        return 2
+    if not _await_external(row):
+        print(f"REFUSED: run #{a.run_id} is not an external dispatch", file=sys.stderr)
+        return 2
+    path = Path(a.file)
+    try:
+        blob = path.read_bytes()
+    except OSError as exc:
+        print(f"ERROR: cannot read {path}: {exc}", file=sys.stderr)
+        return 2
+    if len(blob) > _RESULT_MAX_BYTES:
+        print(f"ERROR: result file is larger than {_RESULT_MAX_BYTES} bytes", file=sys.stderr)
+        return 2
+    try:
+        obj = json.loads(blob.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        print("ERROR: result file is not UTF-8 JSON", file=sys.stderr)
+        return 2
+    err = _validate_external_result(obj)
+    if err:
+        print(f"ERROR: result schema: {err}", file=sys.stderr)
+        return 2
+    stored_ref = row["external_ref"]
+    if stored_ref:
+        if stored_ref == obj["external_ref"]:
+            print(f"✓ run #{a.run_id} ingest no-op (external_ref {stored_ref} already recorded)")
+            return 0
+        print(f"REFUSED: run #{a.run_id} was already ingested as external_ref {stored_ref}",
+              file=sys.stderr)
+        return 2
+    if row["status"] != "running":
+        print(f"REFUSED: run #{a.run_id} is {row['status']}, not awaiting a callback",
+              file=sys.stderr)
+        return 2
+    run_status = "failed" if obj["status"] == "failed" else "finished"
+    cost = obj["cost_usd"]
+    claim = obj["evidence"]["claim"]
+    test_cmd = obj["evidence"]["test_cmd"]
+    blockers = obj["blockers"]
+    blocker_text = "\n".join(f"{b['summary']} (needs {b['needs']})" for b in blockers) or None
+    task_state_before = None
+    if row["task_id"]:
+        task = _get_task(con, row["task_id"])
+        task_state_before = task["state"] if task else None
+    with write_txn(con):
+        # Re-read under the lock so two ingests cannot both book the cost.
+        fresh = con.execute("SELECT * FROM runs WHERE id=?", (a.run_id,)).fetchone()
+        if fresh["external_ref"]:
+            if fresh["external_ref"] == obj["external_ref"]:
+                print(f"✓ run #{a.run_id} ingest no-op (external_ref already recorded)")
+                return 0
+            print(f"REFUSED: run #{a.run_id} was already ingested as external_ref "
+                  f"{fresh['external_ref']}", file=sys.stderr)
+            return 2
+        if fresh["status"] != "running":
+            print(f"REFUSED: run #{a.run_id} is {fresh['status']}, not awaiting a callback",
+                  file=sys.stderr)
+            return 2
+        # Copy only after the lock re-check, so a refused or replayed ingest writes no file.
+        dest = _store_external_result(a.run_id, obj)
+        con.execute("""UPDATE runs SET status=?, cost_usd=?, result_ref=?, external_ref=?,
+                        ended_ts=? WHERE id=?""",
+                    (run_status, cost, str(dest), obj["external_ref"], now_iso(), a.run_id))
+        if row["task_id"]:
+            task = _get_task(con, row["task_id"], for_update=True)
+            if task:
+                ev = _loads(task["evidence"], {})
+                if test_cmd.strip():
+                    ev["test_cmd"] = test_cmd
+                ev["claim"] = claim
+                ev["artifact_links"] = obj["artifact_links"]
+                # A new claim invalidates a previous conductor verification. Same rule as
+                # `task evidence`. This command does not set verified_by_conductor, and it
+                # does not touch tasks.state.
+                ev.pop("verified_by_conductor", None)
+                ev.pop("verified_ts", None)
+                con.execute("UPDATE tasks SET evidence=?, spent_usd=spent_usd+?, updated_ts=? "
+                            "WHERE id=?",
+                            (json.dumps(ev), cost, now_iso(), row["task_id"]))
+        agent = con.execute("SELECT state FROM workstreams WHERE slug=?",
+                            (row["agent_slug"],)).fetchone()
+        agent_state = agent["state"] if agent else "ACTIVE"
+        did = f"external {obj['status']} ({obj['external_ref']})"
+        con.execute("""INSERT INTO updates (slug,did,files,found,next,review,blockers,state,ref,ts)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (row["agent_slug"], did, None, claim[:500] if claim else None, None, None,
+                     blocker_text, agent_state, str(dest), now_iso()))
+        if blocker_text:
+            con.execute(
+                "UPDATE workstreams SET status_line=?, blockers=?, updated_ts=? WHERE slug=?",
+                (did, blocker_text, now_iso(), row["agent_slug"]))
+            body = (f"external run #{a.run_id} on task #{row['task_id']} returned blockers:\n"
+                    + "\n".join(f"- {b['summary']} (needs {b['needs']})" for b in blockers))
+            _insert_id(
+                con,
+                """INSERT INTO messages (from_stream,to_addr,tier,body,ref,ts,kind,requires_action,
+                     supersedes_id,verified) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (row["agent_slug"], "conductor", "BLOCKER", body, obj["external_ref"], now_iso(),
+                 "request", 1, None, 0))
+        else:
+            con.execute("UPDATE workstreams SET status_line=?, updated_ts=? WHERE slug=?",
+                        (did, now_iso(), row["agent_slug"]))
+        _event(con, "conductor", "ingest", f"run:{a.run_id}",
+               f"{obj['status']} → {run_status} ${cost:.4f} ref:{obj['external_ref']}")
+        if row["task_id"] and task_state_before is not None:
+            after = _get_task(con, row["task_id"])
+            if after and after["state"] != task_state_before:
+                raise RuntimeError(
+                    f"ingest changed task #{row['task_id']} state "
+                    f"{task_state_before} → {after['state']}")
+    print(f"✓ ingested run #{a.run_id} ({obj['status']} → {run_status}, ${cost:.4f}) "
+          f"— task state unchanged")
+    return 0
+
+
 # ── shared-resource leases (one physical/simulated device many lanes must take turns on) ────
 def _active_lease(con, resource: str):
     return con.execute(
@@ -1817,8 +2237,9 @@ def _active_lease(con, resource: str):
 
 def _holder_run_alive(con, slug: str) -> bool:
     row = con.execute(
-        "SELECT pid, host, heartbeat_ts FROM runs WHERE agent_slug=? AND status='running' "
-        "ORDER BY id DESC LIMIT 1", (slug,)).fetchone()
+        "SELECT pid, host, heartbeat_ts, await_external FROM runs "
+        "WHERE agent_slug=? AND status='running' ORDER BY id DESC LIMIT 1",
+        (slug,)).fetchone()
     return _run_alive(row)
 
 
@@ -1972,10 +2393,16 @@ def _digest_data(con) -> dict:
     for d in decisions:
         exp = _parse(d["expires_ts"])
         d["expiring_24h"] = bool(exp and exp <= now + timedelta(hours=24))
-    # stale: IN_PROGRESS task, no running session, last owner checkpoint older than threshold
+    # stale: IN_PROGRESS task, no live local session, last owner checkpoint older than threshold.
+    # An external dispatch stays status=running with no pid, so it must not suppress this signal —
+    # otherwise a webhook that never calls back never goes stale. The 12h clock is unchanged
+    # (last checkpoint, else task.updated_ts). The run itself stays open until ingest.
     stale_tasks = []
     for t in tasks:
-        if t["state"] != "IN_PROGRESS" or not t["owner_slug"] or t["owner_slug"] in running:
+        if t["state"] != "IN_PROGRESS" or not t["owner_slug"]:
+            continue
+        live = running.get(t["owner_slug"])
+        if live and not _await_external(live):
             continue
         cp = con.execute("SELECT ts FROM updates WHERE slug=? ORDER BY ts DESC LIMIT 1",
                          (t["owner_slug"],)).fetchone()
@@ -2435,6 +2862,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("harvest", help="collect finished background runs into the ledger")
     s.set_defaults(fn=cmd_harvest)
+
+    s = sub.add_parser("dispatch", help="POST an investigate task to the Grok webhook")
+    s.add_argument("--task", type=int, required=True)
+    s.set_defaults(fn=cmd_dispatch)
+
+    s = sub.add_parser("ingest", help="record an external worker result; does not change task state")
+    s.add_argument("--run", dest="run_id", type=int, required=True)
+    s.add_argument("--token", required=True, help="one-time callback token printed by dispatch")
+    s.add_argument("--file", required=True, help="path to the result JSON")
+    s.set_defaults(fn=cmd_ingest)
 
     s = sub.add_parser("retire", help="park an agent (optionally remove its worktree)")
     s.add_argument("--agent", required=True)

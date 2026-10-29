@@ -312,6 +312,21 @@ assignment, spend by model, recent switches). Agents store the ALIAS (`sonnet`/`
   `fleet report` and re-tier on evidence. The bet being tested: specification quality
   (Fable-written briefs/rubrics) substitutes for judgment tier at execution time.
 
+## External workers (webhook)
+
+`fleet dispatch --task N` POSTs an **investigate** task to `$FLEET_GROK_WEBHOOK_URL` (bearer
+`$FLEET_GROK_WEBHOOK_TOKEN`). It does not launch Claude or Codex and it does not change task
+state — set `IN_PROGRESS` first, the same way you do before `spawn`. Dispatch only when the
+task has **no repo and no territory**: the worker must not write a checkout. Never put
+`FLEET_DB` or the webhook token in the task text; the contract is the task row, and dispatch
+refuses to send a body that contains either. The callback token is shown once on stdout.
+Results come back through `fleet ingest --run N --token … --file result.json` (save a git
+push or an email attachment to that file — there is no listener here). Ingest records cost,
+evidence, and blockers and does **not** set `IN_REVIEW` or `DONE`. A missing pid is not
+failure while the callback is outstanding; after 12 hours with no checkpoint the existing
+stale-task signal fires and the run stays open until ingest. Schema:
+[`docs/grok-worker.md`](../docs/grok-worker.md).
+
 ## Standing rules
 - **Merges (founder delegation 2026-07-07): the Conductor merges a PR once it is
   evidence-verified AND its required review posts clearance** — do not queue merge-ready PRs

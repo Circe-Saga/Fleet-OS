@@ -1,0 +1,14 @@
+{
+  "task_id": 1,
+  "run_id": 1,
+  "objective": "Return the first markdown heading of README.md.",
+  "kind": "investigate",
+  "done_criteria": "evidence.claim equals the first heading of README.md and fleet verify re-reads that file and exits 0.",
+  "dont_touch": "Do not send email, open a PR, push, browse, or request credentials.",
+  "context_refs": [
+    {"ptr": "README.md", "why": "the heading under test"}
+  ],
+  "budget_usd": null,
+  "callback_token": "example-callback-token-not-a-secret",
+  "nonce": "example-nonce"
+}

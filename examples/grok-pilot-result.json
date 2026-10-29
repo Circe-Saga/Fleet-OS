@@ -1,0 +1,11 @@
+{
+  "status": "completed",
+  "artifact_links": [],
+  "evidence": {
+    "claim": "# Fleet-OS — the Agent OS substrate + worker runtime",
+    "test_cmd": "python3 -c \"import pathlib; line=pathlib.Path('README.md').read_text().splitlines()[0]; assert line=='# Fleet-OS — the Agent OS substrate + worker runtime'\""
+  },
+  "blockers": [],
+  "cost_usd": 0.01,
+  "external_ref": "grok-routine-pilot-1"
+}

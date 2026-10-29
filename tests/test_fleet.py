@@ -6,9 +6,11 @@ launcher, dry-run, hooks fail-open/block-once, waiting-queue rendering, review p
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -17,6 +19,7 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
@@ -975,6 +978,332 @@ class TestMultiHost(FleetCase):
                    env_extra={"FLEET_COMMANDER": "alice@hostA"})
         rows = self.q("SELECT commander FROM events WHERE action='lease-acquire'")
         self.assertEqual(rows[0]["commander"], "alice@hostA")
+
+
+class _CapturingHandler(BaseHTTPRequestHandler):
+    """Local stand-in for the Grok routine webhook. Records the POST; never dials out."""
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n)
+        self.server.captured.append({
+            "auth": self.headers.get("Authorization"),
+            "body": body,
+            "path": self.path,
+        })
+        self.send_response(204)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        return
+
+
+_CONTRACT_KEYS = {
+    "task_id", "run_id", "objective", "kind", "done_criteria", "dont_touch",
+    "context_refs", "budget_usd", "callback_token", "nonce",
+}
+
+
+class TestExternalWorker(FleetCase):
+    """Pilot completion checks for fleet dispatch / fleet ingest. The webhook is local."""
+
+    def setUp(self):
+        super().setUp()
+        self.httpd = None
+        ThreadingHTTPServer.allow_reuse_address = True
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _CapturingHandler)
+        self.httpd.captured = []
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+        port = self.httpd.server_address[1]
+        self.bearer = "test-bearer-secret"
+        self.env["FLEET_GROK_WEBHOOK_URL"] = f"http://127.0.0.1:{port}/dispatch"
+        self.env["FLEET_GROK_WEBHOOK_TOKEN"] = self.bearer
+
+    def tearDown(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        super().tearDown()
+
+    def _investigate(self, objective="Return the first heading of README.md", **kw):
+        kw.setdefault("owner", "grok-pilot")
+        return self.add_task(objective=objective, kind="investigate", **kw)
+
+    def _dispatch(self, tid):
+        before = len(self.httpd.captured)
+        r = self.fleet("dispatch", "--task", str(tid))
+        self.assertEqual(len(self.httpd.captured), before + 1)
+        hit = self.httpd.captured[-1]
+        body = json.loads(hit["body"].decode())
+        token = body["callback_token"]
+        self.assertEqual(r.stdout.count(token), 1)
+        self.assertNotIn(self.bearer, r.stdout)
+        self.assertNotIn(self.bearer, r.stderr)
+        self.assertNotIn(self.env["FLEET_DB"], r.stdout)
+        return body["run_id"], token, body, hit
+
+    def _write_result(self, name, obj):
+        path = Path(self.tmp.name) / name
+        path.write_text(json.dumps(obj))
+        return str(path)
+
+    def _result(self, *, status="completed", claim="# Pilot heading", test_cmd="true",
+                blockers=None, cost=1.25, ref="ref-1", extra=None):
+        obj = {
+            "status": status,
+            "artifact_links": [],
+            "evidence": {"claim": claim, "test_cmd": test_cmd},
+            "blockers": blockers or [],
+            "cost_usd": cost,
+            "external_ref": ref,
+        }
+        if extra:
+            obj.update(extra)
+        return obj
+
+    def _snap(self):
+        return {
+            "runs": self.q("SELECT id, status, cost_usd, external_ref, ended_ts, result_ref "
+                           "FROM runs ORDER BY id"),
+            "tasks": self.q("SELECT id, state, spent_usd, evidence FROM tasks ORDER BY id"),
+            "events": self.q("SELECT action, subject, detail FROM events ORDER BY id"),
+            "msgs": self.q("SELECT id, tier, kind, to_addr, body FROM messages ORDER BY id"),
+            "updates": self.q("SELECT id, slug, did FROM updates ORDER BY id"),
+            "decisions": self.q("SELECT id, question FROM decisions ORDER BY id"),
+        }
+
+    def test_dispatch_records_run_event_and_posts_contract_without_secrets(self):
+        tid = self._investigate()
+        run_id, token, body, hit = self._dispatch(tid)
+        self.assertEqual(set(body), _CONTRACT_KEYS)
+        self.assertEqual(body["task_id"], tid)
+        self.assertEqual(body["run_id"], run_id)
+        self.assertEqual(body["kind"], "investigate")
+        raw = hit["body"]
+        self.assertNotIn(b"FLEET_DB", raw)
+        self.assertNotIn(self.bearer.encode(), raw)
+        self.assertNotIn(self.env["FLEET_DB"].encode(), raw)
+        self.assertNotIn(self.env["FLEET_GROK_WEBHOOK_URL"].encode(), raw)
+        self.assertEqual(hit["auth"], f"Bearer {self.bearer}")
+        self.assertEqual(hit["path"], "/dispatch")
+        row = self.q("SELECT * FROM runs WHERE id=?", (run_id,))[0]
+        self.assertEqual(row["status"], "running")
+        self.assertEqual(row["await_external"], 1)
+        self.assertEqual(row["model"], "grok")
+        self.assertEqual(row["product"], "claude")  # CHECK cannot grow; model carries grok
+        self.assertIsNone(row["pid"])
+        self.assertIsNone(row["external_ref"])
+        self.assertEqual(row["callback_token_hash"], hashlib.sha256(token.encode()).hexdigest())
+        self.assertNotEqual(row["callback_token_hash"], token)
+        self.assertNotIn(token, row["callback_token_hash"])
+        events = self.q("SELECT action, detail FROM events WHERE action='dispatch'")
+        self.assertEqual(len(events), 1)
+        self.assertNotIn(token, events[0]["detail"] or "")
+        self.assertNotIn(self.bearer, events[0]["detail"] or "")
+        self.assertNotIn(self.env["FLEET_DB"], events[0]["detail"] or "")
+
+    def test_tick_leaves_awaiting_run_running(self):
+        tid = self._investigate()
+        run_id, _token, _body, _hit = self._dispatch(tid)
+        out = self.fleet("tick").stdout
+        self.assertIn("awaiting external callback", out)
+        row = self.q("SELECT status, ended_ts FROM runs WHERE id=?", (run_id,))[0]
+        self.assertEqual(row["status"], "running")
+        self.assertIsNone(row["ended_ts"])
+
+    def test_ingest_bad_token_writes_nothing(self):
+        tid = self._investigate()
+        run_id, _token, _body, _hit = self._dispatch(tid)
+        path = self._write_result("bad-token.json", self._result())
+        before = self._snap()
+        r = self.fleet("ingest", "--run", str(run_id), "--token", "not-the-token",
+                       "--file", path, expect=2)
+        self.assertIn("REFUSED", r.stderr)
+        self.assertEqual(self._snap(), before)
+
+    def test_ingest_completed_books_cost_and_does_not_finish_task(self):
+        tid = self._investigate()
+        run_id, token, _body, _hit = self._dispatch(tid)
+        self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                   "--actor", "conductor")
+        self.register_worktree("grok-pilot")
+        self.fleet("task", "evidence", "--id", str(tid), "--test-cmd", "true")
+        self.fleet("verify", "--task", str(tid))
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertTrue(ev.get("verified_by_conductor"))
+        path = self._write_result("ok.json", self._result(cost=1.5, ref="pilot-ok"))
+        self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", path)
+        task = self.q("SELECT state, spent_usd, evidence FROM tasks WHERE id=?", (tid,))[0]
+        self.assertEqual(task["state"], "IN_PROGRESS")
+        self.assertNotEqual(task["state"], "DONE")
+        self.assertAlmostEqual(task["spent_usd"], 1.5)
+        ev = json.loads(task["evidence"])
+        self.assertNotIn("verified_by_conductor", ev)
+        self.assertNotIn("verified_ts", ev)
+        self.assertEqual(ev["claim"], "# Pilot heading")
+        run = self.q("SELECT status, cost_usd, external_ref FROM runs WHERE id=?", (run_id,))[0]
+        self.assertEqual(run["status"], "finished")
+        self.assertAlmostEqual(run["cost_usd"], 1.5)
+        self.assertEqual(run["external_ref"], "pilot-ok")
+        self.assertEqual(self.q("SELECT id FROM decisions"), [])
+
+    def test_verify_passes_only_when_claim_matches_readme_heading(self):
+        heading = "# Pilot heading"
+        tid = self._investigate()
+        self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                   "--actor", "conductor")
+        wt = self.register_worktree("grok-pilot")
+        (wt / "README.md").write_text(heading + "\n\nbody\n")
+
+        def check(expected):
+            script = (
+                "import pathlib,sys; "
+                "got=pathlib.Path('README.md').read_text().splitlines()[0]; "
+                f"sys.exit(0 if got=={json.dumps(expected)} else 1)"
+            )
+            return f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        run_id, token, _body, _hit = self._dispatch(tid)
+        wrong = self._write_result("wrong.json", self._result(
+            claim="nope", test_cmd=check("nope"), ref="claim-wrong", cost=0.2))
+        self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", wrong)
+        self.fleet("verify", "--task", str(tid), expect=1)
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertFalse(ev.get("verified_by_conductor"))
+        self.assertEqual(self.q("SELECT state FROM tasks WHERE id=?", (tid,))[0]["state"],
+                         "IN_PROGRESS")
+
+        run2, token2, _body2, _hit2 = self._dispatch(tid)
+        right = self._write_result("right.json", self._result(
+            claim=heading, test_cmd=check(heading), ref="claim-right", cost=0.2))
+        self.fleet("ingest", "--run", str(run2), "--token", token2, "--file", right)
+        self.fleet("verify", "--task", str(tid))
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertEqual(ev["claim"], heading)
+        self.assertTrue(ev.get("verified_by_conductor"))
+        self.assertEqual(self.q("SELECT state FROM tasks WHERE id=?", (tid,))[0]["state"],
+                         "IN_PROGRESS")
+
+    def test_ingest_same_external_ref_is_noop_different_ref_refused(self):
+        tid = self._investigate()
+        run_id, token, _body, _hit = self._dispatch(tid)
+        path = self._write_result("once.json", self._result(cost=0.4, ref="same-ref"))
+        self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", path)
+        spent = self.q("SELECT spent_usd FROM tasks WHERE id=?", (tid,))[0]["spent_usd"]
+        events = len(self.q("SELECT id FROM events"))
+        again = self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", path)
+        self.assertIn("no-op", again.stdout)
+        self.assertAlmostEqual(
+            self.q("SELECT spent_usd FROM tasks WHERE id=?", (tid,))[0]["spent_usd"], spent)
+        self.assertEqual(len(self.q("SELECT id FROM events")), events)
+        other = self._write_result("other.json", self._result(cost=9, ref="other-ref"))
+        before = self._snap()
+        r = self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", other, expect=2)
+        self.assertIn("REFUSED", r.stderr)
+        self.assertEqual(self._snap(), before)
+
+    def test_blockers_surface_in_digest_not_as_a_decision(self):
+        tid = self._investigate()
+        self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                   "--actor", "conductor")
+        run_id, token, _body, _hit = self._dispatch(tid)
+        blockers = [{"summary": "README heading was not in the contract", "needs": "founder"}]
+        path = self._write_result("blocked.json", self._result(
+            status="blocked", claim="", test_cmd="", blockers=blockers, cost=0.05, ref="blocked-1"))
+        self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", path)
+        self.assertEqual(self.q("SELECT state FROM tasks WHERE id=?", (tid,))[0]["state"],
+                         "IN_PROGRESS")
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertFalse(ev.get("verified_by_conductor"))
+        self.assertEqual(self.q("SELECT id FROM decisions"), [])
+        run = self.q("SELECT status FROM runs WHERE id=?", (run_id,))[0]
+        self.assertEqual(run["status"], "finished")  # no blocked run status; the message is the signal
+        digest = json.loads(self.fleet("digest", "--json").stdout)
+        self.assertEqual(digest["open_decisions"], [])
+        self.assertTrue(digest["gate_requests"])
+        msg = digest["gate_requests"][0]
+        self.assertEqual(msg["tier"], "BLOCKER")
+        self.assertEqual(msg["kind"], "request")
+        self.assertEqual(msg["to_addr"], "conductor")
+        self.assertIn("needs founder", msg["body"])
+        self.assertIn(msg["id"], [m["id"] for m in digest["unrouted_messages"]])
+
+    def test_dispatch_refuses_non_investigate_repo_and_secret_text(self):
+        impl = self.add_task(kind="implement", objective="write code")
+        r = self.fleet("dispatch", "--task", str(impl), expect=2)
+        self.assertIn("investigate", r.stderr)
+        self.assertEqual(self.httpd.captured, [])
+        self.assertEqual(self.q("SELECT id FROM runs"), [])
+
+        with_repo = self._investigate(repo="acme-api")
+        r = self.fleet("dispatch", "--task", str(with_repo), expect=2)
+        self.assertIn("repo", r.stderr)
+        self.assertEqual(self.httpd.captured, [])
+
+        leaked = self._investigate(objective="please echo FLEET_DB")
+        r = self.fleet("dispatch", "--task", str(leaked), expect=2)
+        self.assertIn("FLEET_DB", r.stderr)
+        self.assertNotIn("callback_token:", r.stdout)
+        self.assertEqual(self.httpd.captured, [])
+        self.assertEqual(self.q("SELECT status FROM runs")[0]["status"], "failed")
+
+        self.fleet("dispatch", "--task", str(self._investigate()), expect=2,
+                   env_extra={"FLEET_GROK_WEBHOOK_URL": ""})
+        # The leaked attempt above is the only run; a missing URL must not add another.
+        self.assertEqual(len(self.q("SELECT id FROM runs")), 1)
+
+    def test_stale_signal_after_12h_while_run_stays_open(self):
+        tid = self._investigate()
+        run_id, _token, _body, _hit = self._dispatch(tid)
+        self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                   "--actor", "conductor")
+        fresh = json.loads(self.fleet("digest", "--json").stdout)
+        self.assertNotIn(tid, [s["task"] for s in fresh["stale_tasks"]])
+        old = _iso(-13 * 3600)
+        self.raw_exec("UPDATE tasks SET updated_ts=? WHERE id=?", (old, tid))
+        self.raw_exec("UPDATE runs SET started_ts=? WHERE id=?", (old, run_id))
+        stale = json.loads(self.fleet("digest", "--json").stdout)
+        self.assertIn(tid, [s["task"] for s in stale["stale_tasks"]])
+        out = self.fleet("tick").stdout
+        self.assertIn("STALE", out)
+        self.assertIn("awaiting external callback", out)
+        row = self.q("SELECT status, ended_ts FROM runs WHERE id=?", (run_id,))[0]
+        self.assertEqual(row["status"], "running")
+        self.assertIsNone(row["ended_ts"])
+
+    def test_ingest_rejects_unknown_keys_and_bool_cost(self):
+        tid = self._investigate()
+        run_id, token, _body, _hit = self._dispatch(tid)
+        self.fleet("task", "set-state", "--id", str(tid), "--state", "IN_PROGRESS",
+                   "--actor", "conductor")
+        sneaky = self._write_result("sneaky.json", self._result(extra={"task_state": "DONE"}))
+        before = self._snap()
+        r = self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", sneaky, expect=2)
+        self.assertIn("unknown keys", r.stderr)
+        self.assertEqual(self._snap(), before)
+        self.assertEqual(self.q("SELECT state FROM tasks WHERE id=?", (tid,))[0]["state"],
+                         "IN_PROGRESS")
+        bad_cost = self._write_result("bool.json", self._result(cost=True))
+        r = self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", bad_cost, expect=2)
+        self.assertIn("cost_usd", r.stderr)
+        self.assertEqual(self._snap(), before)
+
+    def test_published_example_result_ingests(self):
+        example = HERE.parent / "examples" / "grok-pilot-result.json"
+        contract = json.loads((HERE.parent / "examples" / "grok-pilot-contract.json").read_text())
+        self.assertEqual(set(contract), _CONTRACT_KEYS)
+        self.assertNotIn("FLEET_DB", json.dumps(contract))
+        tid = self._investigate()
+        run_id, token, _body, _hit = self._dispatch(tid)
+        self.fleet("ingest", "--run", str(run_id), "--token", token, "--file", str(example))
+        ev = json.loads(self.q("SELECT evidence FROM tasks WHERE id=?", (tid,))[0]["evidence"])
+        self.assertEqual(ev["claim"], "# Fleet-OS — the Agent OS substrate + worker runtime")
+        self.assertAlmostEqual(
+            self.q("SELECT spent_usd FROM tasks WHERE id=?", (tid,))[0]["spent_usd"], 0.01)
+        self.assertEqual(
+            self.q("SELECT external_ref, status FROM runs WHERE id=?", (run_id,))[0]["external_ref"],
+            "grok-routine-pilot-1")
 
 
 if __name__ == "__main__":
